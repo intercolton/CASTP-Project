@@ -1,0 +1,33 @@
+# Пример сервера диагностики для Ubuntu 24.04.
+# Сертификат и ключ должны существовать до запуска.
+
+[server]
+id = "gateway-01"
+listen = "0.0.0.0:443"
+log_level = "info"
+data_dir = "/var/lib/astp-probe"
+
+[tls]
+cert_file = "/etc/astp-probe/cert.pem"
+key_file = "/etc/astp-probe/key.pem"
+
+[quic]
+enable = true
+listen = "0.0.0.0:443"
+
+# Административный порт отделён от публичных диагностических endpoints.
+# Приём телеметрии на нём ещё не реализован.
+[admin]
+listen = "127.0.0.1:9443"
+token_env = "ASTP_TOKEN"
+
+[limits]
+max_connections = 32
+max_session_seconds = 3600
+max_session_bytes = 67108864
+idle_timeout_seconds = 60
+handshake_timeout_seconds = 10
+
+[logs]
+max_file_bytes = 16777216
+keep_files = 8

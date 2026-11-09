@@ -1,0 +1,49 @@
+# Пример клиента. Скопируйте и поправьте под свою сеть.
+# Секреты сюда не кладите: токен доставки читается из переменной окружения.
+
+[client]
+id = "client-01"
+network_id = "network-a"
+log_level = "info"
+data_dir = "./data"
+
+[schedule]
+quick_interval_seconds = 300
+long_interval_seconds = 1800
+long_duration_seconds = 300
+jitter_percent = 10
+
+[limits]
+max_connections = 4
+max_test_bytes = 10485760
+connect_timeout_seconds = 5
+
+[logs]
+max_file_bytes = 16777216
+keep_files = 8
+
+# Доставка результатов на административный порт сервера.
+# Код приёма ещё не включён: секция описывает будущий контракт.
+# [delivery]
+# url = "https://probe.example.net:9443/v1/events"
+# token_env = "ASTP_TOKEN"
+# ca_file = "/etc/astp-probe/ca.pem"
+# tls_server_name = "probe.example.net"
+
+[[targets]]
+id = "gateway-01"
+host = "probe.example.net"
+port = 443
+enable_tcp = true
+enable_tls = true
+enable_h2 = true
+enable_quic = true
+enable_h3 = true
+
+# Если host — IP, tls_server_name обязателен: проверка сертификата не отключается.
+# tls_server_name = "probe.example.net"
+# ca_file = "/etc/astp-probe/ca.pem"
+
+[[controls]]
+id = "control-wikipedia"
+url = "https://www.wikipedia.org/"

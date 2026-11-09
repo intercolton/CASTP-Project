@@ -1,0 +1,562 @@
+//! Client and server together on localhost with a private test CA.
+
+use probe_client::{probes, run_quick, Selection};
+use probe_common::config::{ClientConfig, ServerConfig};
+use probe_common::jsonl::read_events;
+use probe_common::{ErrorCode, Phase, ProbeEvent, Side, TestType};
+use std::path::Path;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+
+struct Pki {
+    dir: tempfile::TempDir,
+}
+
+impl Pki {
+    /// A CA plus a leaf for `probe.test`; `other_ca.pem` is an unrelated CA.
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "astp test CA");
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["probe.test".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+
+        let other_key = rcgen::KeyPair::generate().unwrap();
+        let mut other_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        other_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let other = other_params.self_signed(&other_key).unwrap();
+
+        std::fs::write(dir.path().join("ca.pem"), ca.pem()).unwrap();
+        std::fs::write(dir.path().join("other_ca.pem"), other.pem()).unwrap();
+        std::fs::write(dir.path().join("cert.pem"), leaf.pem()).unwrap();
+        std::fs::write(dir.path().join("key.pem"), leaf_key.serialize_pem()).unwrap();
+        Pki { dir }
+    }
+
+    fn path(&self, f: &str) -> String {
+        self.dir.path().join(f).display().to_string()
+    }
+}
+
+fn server_cfg(pki: &Pki, data: &Path, handshake_timeout: u64) -> ServerConfig {
+    ServerConfig::from_toml(&format!(
+        r#"
+[server]
+id = "gw-test"
+listen = "127.0.0.1:0"
+data_dir = '{data}'
+[tls]
+cert_file = '{cert}'
+key_file = '{key}'
+[limits]
+max_connections = 16
+max_session_seconds = 60
+max_session_bytes = 1048576
+idle_timeout_seconds = 10
+handshake_timeout_seconds = {handshake_timeout}
+"#,
+        data = data.display(),
+        cert = pki.path("cert.pem"),
+        key = pki.path("key.pem"),
+    ))
+    .unwrap()
+}
+
+fn client_cfg(port: u16, ca: &str, data: &Path) -> ClientConfig {
+    ClientConfig::from_toml(&format!(
+        r#"
+[client]
+id = "client-test"
+network_id = "loopback"
+data_dir = '{data}'
+[[targets]]
+id = "gw-test"
+host = "127.0.0.1"
+port = {port}
+tls_server_name = "probe.test"
+ca_file = '{ca}'
+"#,
+        data = data.display(),
+    ))
+    .unwrap()
+}
+
+async fn collect(cfg: &ClientConfig, sel: Selection) -> Vec<ProbeEvent> {
+    let mut out = Vec::new();
+    run_quick(cfg, sel, |e| out.push(e)).await;
+    out
+}
+
+fn sel_tcp_tls_https_h2() -> Selection {
+    Selection {
+        tcp: true,
+        tls: true,
+        https: true,
+        h2: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn client_and_server_agree() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+
+    let events = collect(&cfg, sel_tcp_tls_https_h2()).await;
+    assert_eq!(events.len(), 4);
+    for e in &events {
+        e.validate().unwrap();
+        assert!(e.success, "{e:?}");
+        assert_eq!(e.side, Side::Client);
+    }
+    let h2 = events
+        .iter()
+        .find(|e| e.test_type == TestType::H2Request)
+        .unwrap();
+    assert_eq!(
+        h2.alpn.as_deref(),
+        Some("h2"),
+        "real HTTP/2 via ALPN (AC-04)"
+    );
+    assert_eq!(h2.phase, Some(Phase::Completed));
+    assert!(h2.bytes_received > 0 && h2.bytes_sent > 0);
+    let tls = events
+        .iter()
+        .find(|e| e.test_type == TestType::TlsHandshake)
+        .unwrap();
+    assert_eq!(tls.detail.as_deref(), Some("TLSv1_3"));
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+
+    let (server_events, bad) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    assert!(bad.is_empty());
+    // Requests carry the client's test_id: the two views join (spec 6.4).
+    for tt in [TestType::HttpsGet, TestType::H2Request] {
+        let c = events.iter().find(|e| e.test_type == tt).unwrap();
+        let s = server_events
+            .iter()
+            .find(|e| e.test_id == c.test_id)
+            .unwrap_or_else(|| panic!("server has no event for {tt:?}"));
+        assert_eq!(s.side, Side::Server);
+        assert_eq!(s.test_type, tt);
+    }
+    // One accept per client connection (tcp, tls, https, h2).
+    let accepts: Vec<_> = server_events
+        .iter()
+        .filter(|e| e.test_type == TestType::TcpAccept)
+        .collect();
+    assert_eq!(accepts.len(), 4, "{accepts:#?}");
+    // The plain TCP test closed without sending anything.
+    assert!(accepts
+        .iter()
+        .any(|e| !e.success && e.phase == Some(Phase::TcpConnected)));
+}
+
+#[tokio::test]
+async fn wrong_ca_is_a_certificate_error() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("other_ca.pem"), data.path());
+    let events = collect(
+        &cfg,
+        Selection {
+            tls: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(events[0].error_code, Some(ErrorCode::TlsCertificateError));
+    assert_eq!(events[0].phase, Some(Phase::TcpConnected));
+    server.shutdown().await.unwrap();
+}
+
+/// The pattern seen on the wire against TSPU: TCP connects, the first part of
+/// the ClientHello arrives, nothing more. The server must record it as an
+/// accepted connection that received bytes but never finished TLS.
+#[tokio::test]
+async fn partial_client_hello_is_logged_by_server() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 1))
+        .await
+        .unwrap();
+
+    let mut s = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    // A TLS record header announcing 512 bytes of handshake, then only 100.
+    let mut partial = vec![0x16, 0x03, 0x01, 0x02, 0x00];
+    partial.extend(std::iter::repeat_n(0u8, 100));
+    s.write_all(&partial).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    drop(s);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.shutdown().await.unwrap();
+
+    let (ev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let a = ev
+        .iter()
+        .find(|e| e.test_type == TestType::TcpAccept)
+        .expect("accept logged");
+    assert!(!a.success);
+    assert_eq!(a.phase, Some(Phase::FirstBytesReceived));
+    assert_eq!(a.bytes_received, 105);
+    assert_eq!(a.error_code, Some(ErrorCode::TlsHandshakeFailed));
+}
+
+#[tokio::test]
+async fn server_unavailable_is_classified() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    let cfg = client_cfg(port, &pki.path("ca.pem"), data.path());
+    let events = collect(&cfg, sel_tcp_tls_https_h2()).await;
+    for e in events {
+        assert_eq!(e.error_code, Some(ErrorCode::TcpRefused), "{e:?}");
+        assert_eq!(e.phase, Some(Phase::DnsResolved));
+    }
+}
+
+fn with_quic(mut cfg: ServerConfig) -> ServerConfig {
+    cfg.quic.enable = true;
+    cfg.quic.listen = Some("127.0.0.1:0".into());
+    cfg
+}
+
+fn quic_target(cfg: &mut ClientConfig, quic_port: u16) {
+    let t = &mut cfg.targets[0];
+    t.enable_quic = true;
+    t.enable_h3 = true;
+    t.quic_port = quic_port;
+}
+
+fn sel_quic_h3() -> Selection {
+    Selection {
+        quic: true,
+        h3: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn quic_and_h3_work_and_join_with_server() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(with_quic(server_cfg(&pki, data.path(), 5)))
+        .await
+        .unwrap();
+    let qport = server.quic_addr.expect("QUIC listener").port();
+    let mut cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    quic_target(&mut cfg, qport);
+
+    let events = collect(&cfg, sel_quic_h3()).await;
+    assert_eq!(events.len(), 2);
+    for e in &events {
+        e.validate().unwrap();
+        assert!(e.success, "{e:?}");
+        assert_eq!(e.transport, probe_common::Transport::Quic);
+        assert_eq!(e.alpn.as_deref(), Some("h3"));
+        assert!(
+            e.bytes_sent > 1200,
+            "QUIC Initial is padded to 1200 B: {e:?}"
+        );
+    }
+    let h3 = events
+        .iter()
+        .find(|e| e.test_type == TestType::H3Request)
+        .unwrap();
+    assert_eq!(h3.phase, Some(Phase::Completed));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    server.shutdown().await.unwrap();
+    let (sev, bad) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    assert!(bad.is_empty());
+    let s = sev
+        .iter()
+        .find(|e| e.test_id == h3.test_id)
+        .expect("server saw the h3 test");
+    assert_eq!(s.test_type, TestType::H3Request);
+    assert_eq!(s.transport, probe_common::Transport::Quic);
+    let accepts: Vec<_> = sev
+        .iter()
+        .filter(|e| e.test_type == TestType::QuicAccept)
+        .collect();
+    assert_eq!(accepts.len(), 2, "{accepts:#?}");
+    assert!(accepts.iter().all(|e| e.success), "{accepts:#?}");
+}
+
+#[tokio::test]
+async fn quic_without_listener_is_a_timeout() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = udp.local_addr().unwrap().port();
+    drop(udp);
+    let mut cfg = client_cfg(1, &pki.path("ca.pem"), data.path());
+    quic_target(&mut cfg, port);
+    cfg.limits.tls_timeout_seconds = 1;
+    let events = collect(
+        &cfg,
+        Selection {
+            quic: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        events[0].error_code,
+        Some(ErrorCode::QuicTimeout),
+        "{:?}",
+        events[0]
+    );
+    assert_eq!(events[0].phase, Some(Phase::DnsResolved));
+}
+
+#[tokio::test]
+async fn quic_wrong_ca_is_a_certificate_error() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(with_quic(server_cfg(&pki, data.path(), 5)))
+        .await
+        .unwrap();
+    let mut cfg = client_cfg(server.addr.port(), &pki.path("other_ca.pem"), data.path());
+    quic_target(&mut cfg, server.quic_addr.unwrap().port());
+    let events = collect(
+        &cfg,
+        Selection {
+            quic: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        events[0].error_code,
+        Some(ErrorCode::TlsCertificateError),
+        "{:?}",
+        events[0]
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let a = sev
+        .iter()
+        .find(|e| e.test_type == TestType::QuicAccept)
+        .expect("server logged the failed QUIC handshake");
+    assert!(!a.success);
+}
+
+#[tokio::test]
+async fn control_counts_any_http_answer_as_reachable() {
+    // Exercised against the local server: a 404 still proves reachability.
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let ctx = probes::Ctx {
+        probe_id: "c".into(),
+        network_id: "n".into(),
+        iface: None,
+        limits: cfg.limits.clone(),
+    };
+    // Controls use the public root store, so the private CA is rejected:
+    // that is a certificate error, not a reachable control.
+    let c = probe_common::config::ControlConfig {
+        id: "ctl".into(),
+        url: format!("https://127.0.0.1:{}/nope", server.addr.port()),
+    };
+    let e = probes::control(&ctx, &c).await;
+    assert!(e.control);
+    assert!(!e.success);
+    server.shutdown().await.unwrap();
+}
+
+// ------------------------------------------------------------- streaming ---
+
+use probe_client::stream::{self, SessionPlan};
+
+fn ctx_for(cfg: &ClientConfig) -> probes::Ctx {
+    probes::Ctx {
+        probe_id: cfg.client.id.clone(),
+        network_id: cfg.client.network_id.clone(),
+        iface: None,
+        limits: cfg.limits.clone(),
+    }
+}
+
+#[tokio::test]
+async fn download_completes_and_counts_bytes() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let e = stream::download(&ctx_for(&cfg), &cfg.targets[0], 200_000).await;
+    assert!(e.success, "{e:?}");
+    assert_eq!(e.test_type, TestType::Download);
+    assert_eq!(e.phase, Some(Phase::Completed));
+    assert!(e.bytes_received > 200_000, "raw TLS bytes include the body");
+    assert!(
+        e.detail.as_deref().unwrap().starts_with("200000 B in"),
+        "{e:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let s = sev
+        .iter()
+        .find(|s| s.test_id == e.test_id)
+        .expect("server logged the download");
+    assert!(s.success);
+    assert_eq!(s.bytes_sent, 200_000);
+}
+
+#[tokio::test]
+async fn long_session_runs_to_the_end() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let plan = SessionPlan {
+        seconds: 2,
+        interval_ms: 200,
+        size: 100,
+        stall_seconds: 2,
+    };
+    let e = stream::long_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert!(e.success, "{e:?}");
+    assert!(e.duration_ms >= 1800, "{e:?}");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn long_session_reports_a_freeze() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    // Heartbeats every 3 s but a freeze is declared after 1 s of silence.
+    let plan = SessionPlan {
+        seconds: 10,
+        interval_ms: 3000,
+        size: 100,
+        stall_seconds: 1,
+    };
+    let e = stream::long_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert_eq!(e.error_code, Some(ErrorCode::ApplicationTimeout), "{e:?}");
+    assert_eq!(e.phase, Some(Phase::AppDataReceived));
+    assert!(e.detail.as_deref().unwrap().starts_with("stalled"), "{e:?}");
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn long_session_reports_a_cut() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let plan = SessionPlan {
+        seconds: 30,
+        interval_ms: 200,
+        size: 100,
+        stall_seconds: 10,
+    };
+    let stop = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        server.shutdown().await.unwrap();
+    });
+    let e = stream::long_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    stop.await.unwrap();
+    assert!(
+        matches!(
+            e.error_code,
+            Some(ErrorCode::RemoteClosed | ErrorCode::TcpReset)
+        ),
+        "{e:?}"
+    );
+    assert!(
+        e.duration_ms < 5000,
+        "a cut is reported at once, not as a freeze: {e:?}"
+    );
+}
+
+/// A TCP relay that forwards everything but stops passing server→client
+/// data after `budget` bytes while keeping both sockets open: the
+/// "freeze after N kilobytes" pattern attributed to TSPU (H2).
+async fn freezing_relay(upstream: std::net::SocketAddr, budget: usize) -> std::net::SocketAddr {
+    use tokio::io::AsyncReadExt;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (c, _) = l.accept().await.unwrap();
+        let s = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        let (mut cr, mut cw) = c.into_split();
+        let (mut sr, mut sw) = s.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut cr, &mut sw).await;
+        });
+        let mut left = budget;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = match sr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let pass = n.min(left);
+            if pass > 0 {
+                cw.write_all(&buf[..pass]).await.unwrap();
+                left -= pass;
+            }
+            // Past the budget, data is read and dropped: the client just waits.
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn download_detects_freeze_after_kilobytes() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let relay = freezing_relay(server.addr, 20_000).await;
+    let mut cfg = client_cfg(relay.port(), &pki.path("ca.pem"), data.path());
+    cfg.limits.request_timeout_seconds = 5;
+    let t = std::time::Instant::now();
+    let e = stream::download(&ctx_for(&cfg), &cfg.targets[0], 500_000).await;
+    assert_eq!(e.error_code, Some(ErrorCode::ApplicationTimeout), "{e:?}");
+    let d = e.detail.as_deref().unwrap();
+    assert!(d.starts_with("stalled: no data for 10 s at "), "{d}");
+    assert!(e.bytes_received <= 20_000, "{e:?}");
+    assert!(t.elapsed() < Duration::from_secs(15));
+    server.shutdown().await.unwrap();
+}

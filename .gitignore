@@ -1,0 +1,7 @@
+/target
+**/target
+/data
+.DS_Store
+Thumbs.db
+*.pem
+!tests/fixtures/**

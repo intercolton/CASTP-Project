@@ -1,0 +1,19 @@
+[Unit]
+Description=ASTP Network Probe scheduled client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/astp-probe run --config /etc/astp-probe/client.toml
+EnvironmentFile=-/etc/astp-probe/client.env
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/astp-probe
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

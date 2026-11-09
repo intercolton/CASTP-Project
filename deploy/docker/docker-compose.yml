@@ -1,0 +1,16 @@
+services:
+  probe-server:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    ports:
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./server.toml:/etc/astp-probe/server.toml:ro
+      - ./certs:/etc/astp-probe/certs:ro
+      - probe-data:/var/lib/astp-probe
+    restart: unless-stopped
+
+volumes:
+  probe-data:

@@ -1,0 +1,19 @@
+[Unit]
+Description=ASTP Network Probe diagnostic server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/astp-probe-server --config /etc/astp-probe/server.toml
+EnvironmentFile=-/etc/astp-probe/server.env
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/astp-probe
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

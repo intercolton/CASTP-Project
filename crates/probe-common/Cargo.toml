@@ -1,0 +1,19 @@
+[package]
+name = "probe-common"
+description = "Shared data model, configuration and JSONL logging for ASTP Network Probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+time.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
