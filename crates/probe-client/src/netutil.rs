@@ -114,10 +114,19 @@ mod tests {
 
     #[tokio::test]
     async fn dns_failure_is_classified() {
-        let f = resolve("does-not-exist.invalid", 443, Duration::from_secs(5))
+        // A DNS label is at most 63 octets (RFC 1035 §3.1): the length
+        // lives in the low 6 bits of the label-length byte. This name
+        // cannot be encoded in a query, so the stub resolver rejects it
+        // in-process and never sends a packet.
+        let host = "a".repeat(64);
+        let f = resolve(&host, 443, Duration::from_secs(5))
             .await
             .unwrap_err();
         assert_eq!(f.code, ErrorCode::DnsFailure);
+        assert!(
+            !f.detail.contains("no DNS answer within"),
+            "lookup blocked on the network: {f:?}"
+        );
     }
 
     #[tokio::test]
