@@ -274,12 +274,12 @@ async fn encode_to_appends_and_a_failed_encode_keeps_the_buffer() {
     let _ = decode(&encode(&ping(1), None).unwrap()).unwrap();
 }
 
-/// F1: version `0x02`, `Length = 16`, then a valid 16-byte PING.
+/// Version `0x02`, `Length = 16`, then a 16-byte PING and one extra byte.
 ///
-/// The PING is the rejected frame's payload. The old reader consumed 8
-/// bytes and the next call returned `Ok(PING)`.
+/// Those bytes are the rejected frame's payload. They stay unread. The
+/// reader is poisoned and does not parse them as the next frame.
 #[tokio::test]
-async fn unknown_version_discards_its_payload_and_poisons() {
+async fn unknown_version_does_not_read_its_payload_and_poisons() {
     let ping_bytes = encode(&ping(1), None).unwrap();
     assert_eq!(ping_bytes.len(), 16);
     let mut data = header(0x02, 0x01, 0, 16).to_vec();
@@ -293,18 +293,14 @@ async fn unknown_version_discards_its_payload_and_poisons() {
         frames.read_frame().await,
         Err(FrameError::UnknownVersion { version: 0x02 })
     ));
-    assert_eq!(
-        seen.pos.get(),
-        24,
-        "a legal payload is discarded, and the byte after it is not"
-    );
+    assert_eq!(seen.pos.get(), 8, "payload must not be consumed");
     let polls = seen.polls.get();
     assert!(matches!(
         frames.read_frame().await,
         Err(FrameError::Poisoned)
     ));
     assert_poisoned(&frames, &seen, polls);
-    assert_eq!(seen.pos.get(), 24);
+    assert_eq!(seen.pos.get(), 8);
 }
 
 /// F1: version and flags are not allowed to hide an overlong `Length`.
@@ -352,7 +348,7 @@ async fn overlong_length_wins_over_version_and_reserved_flags() {
 }
 
 #[tokio::test]
-async fn reserved_flags_with_a_legal_length_are_discarded_then_poison() {
+async fn reserved_flags_do_not_read_the_payload_and_poison() {
     let mut data = header(0x01, 0x01, 0x0004, 4).to_vec();
     data.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xFF]);
     let mut script = Script::chunked(data, 3);
@@ -362,14 +358,14 @@ async fn reserved_flags_with_a_legal_length_are_discarded_then_poison() {
         frames.read_frame().await,
         Err(FrameError::ReservedFlags { flags: 0x0004 })
     ));
-    assert_eq!(seen.pos.get(), 12);
+    assert_eq!(seen.pos.get(), 8, "payload must not be consumed");
     let polls = seen.polls.get();
     assert!(matches!(
         frames.read_frame().await,
         Err(FrameError::Poisoned)
     ));
     assert_poisoned(&frames, &seen, polls);
-    assert_eq!(seen.pos.get(), 12);
+    assert_eq!(seen.pos.get(), 8);
 }
 
 #[tokio::test]
@@ -383,7 +379,7 @@ async fn unknown_version_wins_over_reserved_flags_when_length_is_legal() {
         frames.read_frame().await,
         Err(FrameError::UnknownVersion { version: 0x02 })
     ));
-    assert_eq!(seen.pos.get(), 8, "Length 0 has nothing to discard");
+    assert_eq!(seen.pos.get(), 8, "the reader stops after the header");
     let polls = seen.polls.get();
     assert!(matches!(
         frames.read_frame().await,
@@ -466,77 +462,50 @@ async fn connection_reset_after_three_bytes_poisons() {
     assert_eq!(seen.pos.get(), 3);
 }
 
+/// A reset parked inside the unread payload is not observed. The header
+/// error poisons the reader after the 8-byte header.
 #[tokio::test]
-async fn discard_that_hits_reset_returns_io_and_poisons() {
+async fn unknown_version_does_not_reach_a_reset_in_the_payload() {
     let mut data = header(0x02, 0x01, 0, 16).to_vec();
     data.extend_from_slice(&[0x11; 16]);
     let mut script = Script::chunked(data, 1).reset_at(10);
     let seen = script.counters();
     let mut frames = FrameReader::new(&mut script);
-    match frames.read_frame().await {
-        Err(FrameError::Io(err)) => {
-            assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
-        }
-        other => panic!("expected connection reset during discard, got {other:?}"),
-    }
-    assert_eq!(seen.pos.get(), 10);
+    assert!(matches!(
+        frames.read_frame().await,
+        Err(FrameError::UnknownVersion { version: 0x02 })
+    ));
+    assert_eq!(seen.pos.get(), 8, "payload must not be consumed");
     let polls = seen.polls.get();
     assert!(matches!(
         frames.read_frame().await,
         Err(FrameError::Poisoned)
     ));
     assert_poisoned(&frames, &seen, polls);
+    assert_eq!(seen.pos.get(), 8);
 }
 
+/// EOF inside the declared payload is not read. The header error is
+/// returned, the short tail stays in the socket, and the reader is poisoned.
 #[tokio::test]
-async fn discard_that_hits_eof_is_incomplete_and_poisons() {
+async fn unknown_version_does_not_read_a_truncated_payload() {
     let mut data = header(0x02, 0x01, 0, 16).to_vec();
     data.extend_from_slice(&[0x11; 4]);
-    let end = data.len();
     let mut script = Script::chunked(data, 8);
     let seen = script.counters();
     let mut frames = FrameReader::new(&mut script);
     assert!(matches!(
         frames.read_frame().await,
-        Err(FrameError::Incomplete)
-    ));
-    assert_eq!(seen.pos.get(), end);
-    let polls = seen.polls.get();
-    assert!(matches!(
-        frames.read_frame().await,
-        Err(FrameError::Poisoned)
-    ));
-    assert_poisoned(&frames, &seen, polls);
-}
-
-#[tokio::test]
-async fn cancel_during_discard_resumes_then_poisons() {
-    let mut data = header(0x02, 0x01, 0, 16).to_vec();
-    data.extend_from_slice(&[0x11; 16]);
-    let mut script = Script::chunked(data, 1).pending_once_at(12);
-    let seen = script.counters();
-    let mut frames = FrameReader::new(&mut script);
-
-    {
-        let fut = frames.read_frame();
-        let mut fut = std::pin::pin!(fut);
-        drive_until_pending(fut.as_mut());
-        assert_eq!(seen.pos.get(), 12);
-    }
-    assert!(!frames.is_poisoned());
-    assert_eq!(seen.pos.get(), 12, "dropping the future does not rewind");
-
-    assert!(matches!(
-        frames.read_frame().await,
         Err(FrameError::UnknownVersion { version: 0x02 })
     ));
-    assert_eq!(seen.pos.get(), 24);
+    assert_eq!(seen.pos.get(), 8, "payload must not be consumed");
     let polls = seen.polls.get();
     assert!(matches!(
         frames.read_frame().await,
         Err(FrameError::Poisoned)
     ));
     assert_poisoned(&frames, &seen, polls);
+    assert_eq!(seen.pos.get(), 8);
 }
 
 /// A fully consumed frame with a bad body is aligned, and still poisoned.

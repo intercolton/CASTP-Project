@@ -8,7 +8,11 @@ use std::io;
 use thiserror::Error;
 
 /// Failure while encoding or decoding one ASTP-M frame.
+///
+/// The enum is `non_exhaustive`: adding a variant later is not a breaking
+/// change for downstream `match`.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FrameError {
     /// The buffer ended before a header or a payload was complete.
     ///
@@ -31,10 +35,12 @@ pub enum FrameError {
 
     /// `Version` was not `0x01`.
     ///
-    /// On [`crate::FrameReader`], this is returned only when `Length` is
-    /// within the limit. That payload is discarded first, so the socket
-    /// cursor sits on the next frame boundary, and the reader is then
-    /// poisoned. An overlong `Length` is [`Self::FrameTooLong`] instead.
+    /// On [`crate::FrameReader`], `Length` is checked first. An overlong
+    /// `Length` is [`Self::FrameTooLong`] and the payload is not read.
+    /// When `Length` is within the limit this error is returned as soon
+    /// as the header is complete. The payload is not read and is not
+    /// discarded. The reader is poisoned and the connection must be
+    /// closed. The cursor is not on a frame boundary.
     #[error("unknown frame version {version:#04x}")]
     UnknownVersion {
         /// The version byte from the header.
@@ -53,11 +59,13 @@ pub enum FrameError {
 
     /// One or more of flag bits 2–15 were set.
     ///
-    /// On [`crate::FrameReader`], this is returned only when `Length` is
-    /// within the limit and the version is `0x01`. That payload is
-    /// discarded first, and the reader is then poisoned. An overlong
-    /// `Length` is [`Self::FrameTooLong`] instead. An unknown version is
-    /// [`Self::UnknownVersion`] instead.
+    /// On [`crate::FrameReader`], `Length` is checked first and the
+    /// version is checked before these flags. An overlong `Length` is
+    /// [`Self::FrameTooLong`]. An unknown version is
+    /// [`Self::UnknownVersion`]. Otherwise this error is returned as
+    /// soon as the header is complete. The payload is not read and is
+    /// not discarded. The reader is poisoned and the connection must be
+    /// closed. The cursor is not on a frame boundary.
     #[error("reserved flag bits are set ({flags:#06x})")]
     ReservedFlags {
         /// The full flags word from the header.
