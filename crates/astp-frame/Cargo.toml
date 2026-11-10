@@ -1,12 +1,22 @@
 [package]
 name = "astp-frame"
-description = "ASTP-M frame crate (skeleton)"
+description = "ASTP-M v1 frame codec (spec draft 0.3 section 5)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+astp-types.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+# The codec uses AsyncRead (io-util). macros/rt are for tests and doctests.
+# The workspace pin already enables this set; restating it records the need.
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[dev-dependencies]
+# Integration tests name tokio directly (`#[tokio::test]`, `AsyncRead`).
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 
 [lints]
 workspace = true
