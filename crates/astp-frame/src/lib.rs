@@ -23,8 +23,12 @@
 //!   [`FrameError::FrameTooLong`].
 //! * [`DecodeLimits::max_frame`] defaults to 65535 and can only tighten
 //!   that ceiling. A larger stored value does not raise it.
-//! * The stream reader checks `Length` before it allocates or reads the
-//!   payload, so an overlong header does not reserve a multi-megabyte buffer.
+//! * [`FrameReader`] checks `Length` before it allocates or reads the
+//!   payload, so an overlong header does not reserve a multi-megabyte
+//!   buffer. Partial reads stay in the reader across cancellation. Any
+//!   error poisons it; a later read does not touch the socket. See
+//!   [`FrameReader`] for which of those errors leave the cursor on a
+//!   frame boundary.
 //! * Untrusted bytes produce [`FrameError`]. Library paths do not panic on
 //!   a short, malformed, or overlong frame, and they do not log TUN payloads.
 //!
@@ -66,7 +70,7 @@ pub use header::DecodeLimits;
 pub use padding::{
     camouflage_pad_len, encode_camouflage, encode_camouflage_with, CamouflageProfile,
 };
-pub use stream::{read_frame, read_frame_with};
+pub use stream::FrameReader;
 pub use types::{Frame, FrameBody, Ipv4Packet, Ipv6Packet};
 
 pub use astp_types::{

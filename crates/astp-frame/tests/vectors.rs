@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 
 use astp_frame::{
     camouflage_pad_len, decode, decode_with, encode, encode_camouflage_with, CamouflageProfile,
-    DecodeLimits, Frame, FrameBody, FrameError, Ipv4Packet, Ipv6Packet,
+    Config, DecodeLimits, Frame, FrameBody, FrameError, Ipv4Packet, Ipv6Packet, Tlv,
 };
 
 fn hex(text: &str) -> Vec<u8> {
@@ -387,5 +387,69 @@ fn tightened_max_frame_rejects_from_the_header() {
             length: 65_536,
             max_frame: 65_535
         })
+    ));
+}
+
+/// F3: a failing padding fill returns [`FrameError::Random`] and no buffer.
+#[test]
+fn injected_padding_rng_failure_returns_random_and_no_buffer() {
+    let result = encode_camouflage_with(&ping(), &CamouflageProfile::V1, |_| {
+        Err(FrameError::Random {
+            detail: "injected".to_owned(),
+        })
+    });
+    match result {
+        Err(FrameError::Random { detail }) => assert_eq!(detail, "injected"),
+        Ok(buf) => panic!("encoder returned a buffer after RNG failure: {buf:?}"),
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+}
+
+/// F3: `content_len` 54 pads with `pad_len` 0. Wire size 64, flag `0x0001`,
+/// trailer `00 00`. The fill closure is not asked for octets.
+#[test]
+fn pad_len_zero_is_on_the_wire() {
+    let frame = Frame {
+        key_epoch: None,
+        body: FrameBody::Disconnect {
+            code: 1,
+            reason: "x".repeat(52),
+        },
+    };
+    assert_eq!(camouflage_pad_len(54, 64, 64, 255), Some(0));
+    let mut fill_calls = 0usize;
+    let bytes = encode_camouflage_with(&frame, &CamouflageProfile::V1, |buf| {
+        fill_calls += 1;
+        buf.fill(0xAB);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fill_calls, 0);
+    assert_eq!(bytes.len(), 64);
+    assert_eq!(&bytes[2..4], &[0x00, 0x01]);
+    assert_eq!(&bytes[4..8], &56u32.to_be_bytes());
+    assert_eq!(&bytes[62..64], &[0x00, 0x00]);
+    assert_eq!(decode(&bytes).unwrap(), frame);
+}
+
+/// F3: TLV `MaxFrame(7)` is stored and does not cap this same frame.
+/// The body is longer than 7 bytes. A caller-supplied limit of 7 still
+/// rejects it, which is the limit the TLV did not replace.
+#[test]
+fn config_max_frame_tlv_does_not_change_the_decode_limit() {
+    let frame = Frame {
+        key_epoch: None,
+        body: FrameBody::Config(Config {
+            cfg_id: 1,
+            tlvs: vec![Tlv::MaxFrame(7)],
+        }),
+    };
+    let bytes = encode(&frame, None).unwrap();
+    assert!(bytes.len() > 8 + 7);
+    assert_eq!(decode(&bytes).unwrap(), frame);
+    assert!(decode_with(&bytes, DecodeLimits { max_frame: 12 }).is_ok());
+    assert!(matches!(
+        decode_with(&bytes, DecodeLimits { max_frame: 7 }),
+        Err(FrameError::FrameTooLong { max_frame: 7, .. })
     ));
 }

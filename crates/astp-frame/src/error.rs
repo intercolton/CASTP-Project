@@ -14,7 +14,8 @@ pub enum FrameError {
     ///
     /// Also used when a stream reaches EOF after at least one byte of the
     /// frame has already been read. A clean EOF before the first byte of
-    /// the next frame is [`Ok(None)`](crate::read_frame), not this error.
+    /// the next frame is [`Ok(None)`](crate::FrameReader::read_frame), not
+    /// this error. [`crate::FrameReader`] poisons itself after this error.
     #[error("incomplete frame")]
     Incomplete,
 
@@ -29,6 +30,11 @@ pub enum FrameError {
     },
 
     /// `Version` was not `0x01`.
+    ///
+    /// On [`crate::FrameReader`], this is returned only when `Length` is
+    /// within the limit. That payload is discarded first, so the socket
+    /// cursor sits on the next frame boundary, and the reader is then
+    /// poisoned. An overlong `Length` is [`Self::FrameTooLong`] instead.
     #[error("unknown frame version {version:#04x}")]
     UnknownVersion {
         /// The version byte from the header.
@@ -46,6 +52,12 @@ pub enum FrameError {
     },
 
     /// One or more of flag bits 2–15 were set.
+    ///
+    /// On [`crate::FrameReader`], this is returned only when `Length` is
+    /// within the limit and the version is `0x01`. That payload is
+    /// discarded first, and the reader is then poisoned. An overlong
+    /// `Length` is [`Self::FrameTooLong`] instead. An unknown version is
+    /// [`Self::UnknownVersion`] instead.
     #[error("reserved flag bits are set ({flags:#06x})")]
     ReservedFlags {
         /// The full flags word from the header.
@@ -55,7 +67,10 @@ pub enum FrameError {
     /// `Length` is above the protocol ceiling or the caller’s `max_frame`.
     ///
     /// Raised from the header. The payload is not allocated and, on a
-    /// stream, not read.
+    /// stream, not read. [`crate::FrameReader`] checks `Length` before
+    /// version and flags, so this variant wins when the header is also
+    /// an unknown version or has reserved flags. The reader is poisoned
+    /// and the unread payload stays in the socket.
     #[error("frame length {length} exceeds limit {max_frame}")]
     FrameTooLong {
         /// The `Length` field from the header, or the encoded payload size.
@@ -153,7 +168,9 @@ pub enum FrameError {
     /// The payload fit the length limit, but the allocator refused the buffer.
     ///
     /// Legal frames are at most 64 KiB of payload. This is an out-of-memory
-    /// failure, not a malformed header.
+    /// failure, not a malformed header. On [`crate::FrameReader`], failing
+    /// to reserve the payload buffer happens before that payload is read.
+    /// The reader poisons itself either way.
     #[error("failed to allocate a {length}-byte frame buffer")]
     Alloc {
         /// Requested buffer size in bytes.
@@ -163,8 +180,19 @@ pub enum FrameError {
     /// The stream reader hit an I/O error.
     ///
     /// `Ok(0)` from [`tokio::io::AsyncRead`] is EOF, not this variant.
+    /// [`crate::FrameReader`] poisons itself after this error and does not
+    /// retry the read.
     #[error("I/O error while reading a frame")]
     Io(#[source] io::Error),
+
+    /// [`crate::FrameReader`] will not read another frame.
+    ///
+    /// The read that failed returns the original error and poisons the
+    /// reader. Every later read returns this variant and does not poll
+    /// the socket. A clean EOF ([`Ok(None)`](crate::FrameReader::read_frame))
+    /// does not poison.
+    #[error("frame reader is poisoned")]
+    Poisoned,
 }
 
 impl From<io::Error> for FrameError {

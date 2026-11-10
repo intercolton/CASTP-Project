@@ -67,6 +67,8 @@ pub fn decode(buf: &[u8]) -> Result<Frame, FrameError> {
 /// exactly `8 + Length` bytes”, then padding, then the key-epoch byte,
 /// then the type. An illegal `Length` is rejected before the payload is
 /// required to be present, so a 65536-byte claim does not allocate.
+/// [`crate::FrameReader`] checks `Length` first instead, because a stream
+/// still has to decide whether the payload may be read.
 ///
 /// # Errors
 ///
