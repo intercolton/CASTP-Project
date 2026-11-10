@@ -29,7 +29,7 @@ Toolchain — Rust 1.85, edition 2021. Это не Rust 1.98 и не edition 202
 │   ├── probe-analyzer/    разбор журналов (ещё не реализован)
 │   ├── probe-report/      HTML-отчёт (ещё не реализован)
 │   ├── astp-types/        каркас типов ASTP-M (VPN в разработке, не пробник)
-│   ├── astp-frame/        каркас кадров ASTP-M (VPN в разработке, не пробник)
+│   ├── astp-frame/        кодек кадров ASTP-M v1 (не пробник, не транспорт)
 │   ├── astp-crypto/       каркас криптографии ASTP-M (VPN в разработке, не пробник)
 │   ├── astp-transport/    каркас транспорта ASTP-M (VPN в разработке, не пробник)
 │   ├── astp-session/      каркас сессии ASTP-M (VPN в разработке, не пробник)
@@ -57,7 +57,7 @@ Toolchain — Rust 1.85, edition 2021. Это не Rust 1.98 и не edition 202
 - Диагностический сервер: TCP/TLS, HTTP/1.1, HTTP/2, QUIC и HTTP/3, echo, download, длительная сессия.
 - CLI пробника: `test` и `status`. Команды `run` и `report` разобраны, но ещё не выполняют расписание и отчёт.
 - Каркас крейтов `astp-*`. Бинарники `astp-client` и `astp-server` отказываются: в stderr есть `not implemented`, код выхода 1.
-- Туннель, handshake, кадры, TLS и TUN ASTP-M ещё не реализованы.
+- Кадры прикладного слоя (спека 0.3 §5) кодирует `astp-frame`. Туннель, handshake, TLS и TUN ASTP-M ещё не реализованы.
 
 Неподдерживаемая команда завершается ошибкой. Успех теста не подменяется заглушкой.
 
