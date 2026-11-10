@@ -5,29 +5,34 @@
 //! the reader. The next call continues the same frame.
 
 use std::fmt;
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use astp_types::FRAME_HEADER_LEN;
-use tokio::io::{AsyncRead, ReadBuf};
+use bytes::BufMut;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 
 use crate::codec::decode_with;
 use crate::error::FrameError;
 use crate::header::{DecodeLimits, RawHeader};
 use crate::types::Frame;
 
-/// Finished payload buffers larger than this are dropped.
-///
-/// Smaller ones are cleared and kept, so a run of small frames does not
-/// allocate on every frame, and an idle connection does not hold the
-/// last 64 KiB payload.
-const PAYLOAD_RETAIN_MAX: usize = 8 * 1024;
+/// Payloads at or below this are reused for the next frame.
+const PAYLOAD_RETAIN_PAYLOAD: usize = 8 * 1024;
 
-/// Most payload bytes one poll will take from the socket.
+/// Capacity kept for a retained frame.
 ///
-/// The buffer grows as those bytes arrive. `Length` is not reserved up
-/// front.
+/// The buffer is the 8-byte header plus the payload, so an 8 KiB payload
+/// occupies 8200 bytes. A cap of 8192 drops that frame on every read.
+/// The final size comes from `try_reserve_exact`, not from doubling the
+/// first 4 KiB chunk (that doubling landed on 8208 and had the same effect).
+const PAYLOAD_RETAIN_MAX: usize = FRAME_HEADER_LEN + PAYLOAD_RETAIN_PAYLOAD;
+
+/// Most payload bytes taken from the socket before the exact reserve.
+///
+/// `Length` is not reserved when the header arrives. After this many
+/// payload bytes are in hand, the reader reserves `8 + Length` once.
 const PAYLOAD_READ_CHUNK: usize = 4 * 1024;
 
 /// What one step of the read state machine decided.
@@ -131,11 +136,17 @@ enum Stage {
 /// one buffer. [`decode_with`](crate::decode_with) reads that buffer.
 /// There is no second copy of the frame.
 ///
-/// When a frame finishes, a buffer whose capacity is above 8 KiB is
-/// dropped. A smaller buffer is cleared and kept for the next frame.
-/// The same rule runs on poison, so a failed large frame does not stay
-/// allocated. Dropping [`Self::read_frame`] at `Pending` does not free
-/// a partial payload: those bytes still belong to the current frame.
+/// A finished frame is kept when its payload is at most 8 KiB. The
+/// buffer also holds the 8-byte header, so that payload occupies 8200
+/// bytes and is not treated as too large. A larger payload is dropped,
+/// including on poison, so an idle connection does not hold it.
+///
+/// The reader reserves `8 + Length` only after the first
+/// `min(Length, 4 KiB)` payload bytes have arrived. The header alone
+/// reserves at most that first chunk. Spare capacity is filled by
+/// [`AsyncReadExt::read_buf`]; unread capacity is not zero-filled.
+/// Dropping [`Self::read_frame`] at `Pending` does not free a partial
+/// payload: those bytes still belong to the current frame.
 ///
 /// One-shot [`crate::decode`] checks version, then flags, then length.
 /// That buffer is already in memory, so the order cannot desynchronize
@@ -163,6 +174,8 @@ pub struct FrameReader<R> {
     payload_filled: usize,
     /// Declared `Length` for the payload in progress.
     payload_expected: usize,
+    /// `try_reserve_exact(8 + Length)` has already been attempted.
+    payload_exact: bool,
 }
 
 impl<R> FrameReader<R> {
@@ -189,6 +202,7 @@ impl<R> FrameReader<R> {
             payload: Vec::new(),
             payload_filled: 0,
             payload_expected: 0,
+            payload_exact: false,
         }
     }
 
@@ -223,12 +237,17 @@ impl<R> FrameReader<R> {
 
     /// Drop a large payload buffer. Keep a small one for the next frame.
     fn retain_payload_buf(&mut self) {
+        let expected = self.payload_expected;
+        let cap = self.payload.capacity();
         self.payload_filled = 0;
         self.payload_expected = 0;
-        if self.payload.capacity() > PAYLOAD_RETAIN_MAX {
-            self.payload = Vec::new();
-        } else {
+        self.payload_exact = false;
+        // Keep an 8 KiB payload even though the buffer is 8 bytes larger
+        // than 8192. Drop anything past that, including a doubled cap.
+        if expected <= PAYLOAD_RETAIN_PAYLOAD && cap <= PAYLOAD_RETAIN_MAX {
             self.payload.clear();
+        } else {
+            self.payload = Vec::new();
         }
     }
 
@@ -269,6 +288,7 @@ impl<R> FrameReader<R> {
         self.payload.clear();
         self.payload_filled = 0;
         self.payload_expected = length;
+        self.payload_exact = false;
         // Reserve the header plus at most one read chunk, not `Length`.
         let hint = FRAME_HEADER_LEN.saturating_add(length.min(PAYLOAD_READ_CHUNK));
         if self.payload.capacity() < hint {
@@ -280,6 +300,28 @@ impl<R> FrameReader<R> {
         self.payload.extend_from_slice(&self.header);
         self.stage = Stage::Payload;
         Step::Continue
+    }
+
+    /// After the first chunk is in hand, reserve the whole frame once.
+    ///
+    /// A header with no payload bytes still holds at most one chunk.
+    fn reserve_exact_after_first_chunk(&mut self) -> Result<(), FrameError> {
+        if self.payload_exact {
+            return Ok(());
+        }
+        let threshold = self.payload_expected.min(PAYLOAD_READ_CHUNK);
+        if self.payload_filled < threshold {
+            return Ok(());
+        }
+        let total = FRAME_HEADER_LEN.saturating_add(self.payload_expected);
+        if self.payload.capacity() < total {
+            let extra = total.saturating_sub(self.payload.len());
+            if self.payload.try_reserve_exact(extra).is_err() {
+                return Err(FrameError::Alloc { length: total });
+            }
+        }
+        self.payload_exact = true;
+        Ok(())
     }
 
     fn take_header_bytes(&mut self, n: usize) -> Step {
@@ -404,39 +446,25 @@ where
         if self.payload_filled >= self.payload_expected {
             return self.finish_payload();
         }
-        let remaining = self.payload_expected.saturating_sub(self.payload_filled);
-        let want = remaining.min(PAYLOAD_READ_CHUNK);
-        let start = self.payload.len();
-        if self.payload.capacity().saturating_sub(start) < want
-            && self.payload.try_reserve(want).is_err()
-        {
-            return self.fail(FrameError::Alloc { length: want });
+        if let Err(err) = self.reserve_exact_after_first_chunk() {
+            return self.fail(err);
         }
-        let Some(end) = start.checked_add(want) else {
-            return self.fail(FrameError::Alloc { length: want });
+        let remaining = self.payload_expected.saturating_sub(self.payload_filled);
+        // Before the exact reserve, do not ask for more than one chunk.
+        // After it, the rest of the frame is already backed by capacity.
+        let want = if self.payload_exact {
+            remaining
+        } else {
+            remaining.min(PAYLOAD_READ_CHUNK)
         };
-        // `try_reserve` already made room, so this resize does not allocate.
-        self.payload.resize(end, 0);
-        match poll_read_some(&mut self.reader, cx, &mut self.payload[start..]) {
-            Poll::Pending => {
-                // This poll kept no byte. Drop the spare tail.
-                self.payload.truncate(start);
-                Step::Wait
-            }
-            Poll::Ready(Err(err)) => {
-                self.payload.truncate(start);
-                self.fail(err)
-            }
-            Poll::Ready(Ok(0)) => {
-                self.payload.truncate(start);
-                self.fail(FrameError::Incomplete)
-            }
+        if want == 0 {
+            return self.finish_payload();
+        }
+        match poll_into_payload(&mut self.reader, &mut self.payload, cx, want) {
+            Poll::Pending => Step::Wait,
+            Poll::Ready(Err(err)) => self.fail(err),
+            Poll::Ready(Ok(0)) => self.fail(FrameError::Incomplete),
             Poll::Ready(Ok(n)) => {
-                let Some(kept) = start.checked_add(n) else {
-                    self.payload.truncate(start);
-                    return self.fail(FrameError::Incomplete);
-                };
-                self.payload.truncate(kept);
                 self.payload_filled = self.payload_filled.saturating_add(n);
                 if self.payload_filled >= self.payload_expected {
                     self.finish_payload()
@@ -457,9 +485,42 @@ impl<R> fmt::Debug for FrameReader<R> {
             .field("header_filled", &self.header_filled)
             .field("payload_filled", &self.payload_filled)
             .field("payload_expected", &self.payload_expected)
+            .field("payload_exact", &self.payload_exact)
             .field("payload_len", &self.payload.len())
             .field("payload_capacity", &self.payload.capacity())
             .finish_non_exhaustive()
+    }
+}
+
+/// Append up to `want` payload bytes without zero-filling the spare tail.
+///
+/// `Pending` commits nothing: [`AsyncReadExt::read_buf`] only advances
+/// the buffer after `poll_read` returns `Ready`.
+fn poll_into_payload<R>(
+    reader: &mut R,
+    payload: &mut Vec<u8>,
+    cx: &mut Context<'_>,
+    want: usize,
+) -> Poll<Result<usize, FrameError>>
+where
+    R: AsyncRead + Unpin,
+{
+    let spare = payload.capacity().saturating_sub(payload.len());
+    // Exact, not amortized: a short read must not double a 4 KiB chunk
+    // into an 8 KiB buffer before `Length` is reserved on purpose.
+    if spare < want && payload.try_reserve_exact(want).is_err() {
+        return Poll::Ready(Err(FrameError::Alloc { length: want }));
+    }
+    // `Vec`'s `chunk_mut` grows with `reserve` (which aborts on OOM) only
+    // when `capacity == len`. The `try_reserve` above leaves spare bytes,
+    // so this read does not hit that path and does not zero them.
+    debug_assert!(payload.capacity() > payload.len());
+    let mut limited = payload.limit(want);
+    let mut read = std::pin::pin!(AsyncReadExt::read_buf(reader, &mut limited));
+    match read.as_mut().poll(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
+        Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
     }
 }
 
@@ -485,6 +546,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
     use super::{FrameReader, PAYLOAD_RETAIN_MAX};
     use crate::{encode, Frame, FrameBody};
 
@@ -519,5 +582,78 @@ mod tests {
         assert_eq!(frames.payload.capacity(), kept);
         assert!(frames.read_frame().await.unwrap().is_none());
         assert!(!frames.is_poisoned());
+    }
+
+    #[tokio::test]
+    async fn payloads_from_4097_through_8kib_reuse_the_buffer() {
+        for payload in [4097usize, 6000, 8192] {
+            let frame = Frame {
+                key_epoch: None,
+                body: FrameBody::Disconnect {
+                    code: 1,
+                    reason: "y".repeat(payload - 2),
+                },
+            };
+            let once = encode(&frame, None).unwrap();
+            let mut bytes = once.clone();
+            bytes.extend_from_slice(&once);
+            let mut frames = FrameReader::new(std::io::Cursor::new(bytes));
+            assert_eq!(frames.read_frame().await.unwrap().unwrap(), frame);
+            let cap = frames.payload.capacity();
+            assert!(
+                cap > 0 && cap <= PAYLOAD_RETAIN_MAX,
+                "payload {payload} was released (cap {cap})"
+            );
+            assert_eq!(frames.read_frame().await.unwrap().unwrap(), frame);
+            assert_eq!(
+                frames.payload.capacity(),
+                cap,
+                "payload {payload} reallocated"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn header_alone_does_not_reserve_the_declared_length() {
+        let mut header = [0u8; 8];
+        header[0] = 0x01;
+        header[4..8].copy_from_slice(&60_000u32.to_be_bytes());
+        let mut frames = FrameReader::new(HeaderThenPending {
+            data: header.to_vec(),
+            pos: 0,
+        });
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        {
+            let fut = frames.read_frame();
+            let mut fut = std::pin::pin!(fut);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+        }
+        let cap = frames.payload.capacity();
+        assert!(cap <= 8 + super::PAYLOAD_READ_CHUNK);
+        assert!(cap < 60_000, "header reserved the declared length ({cap})");
+        assert!(!frames.is_poisoned());
+    }
+
+    /// Yields its bytes, then `Pending`.
+    struct HeaderThenPending {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl tokio::io::AsyncRead for HeaderThenPending {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.pos >= self.data.len() || buf.remaining() == 0 {
+                return std::task::Poll::Pending;
+            }
+            let n = buf.remaining().min(self.data.len() - self.pos);
+            buf.put_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
     }
 }
