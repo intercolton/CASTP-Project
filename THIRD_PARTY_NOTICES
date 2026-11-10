@@ -8,5 +8,8 @@ upstream — в LICENSES/anet-LICENSE.md.
 Любой позже перенесённый из anet файл (даже переписанный по мотивам)
 обязан содержать в заголовке источник и SHA, например:
 // Based on ZeroTworu/anet @0c0ffce: anet-common/src/padding_utils.rs
-Код при переносе адаптируется под edition 2021 и rustc 1.85, без повышения
-workspace.package.rust-version.
+Код при переносе адаптируется под edition 2021 и rustc 1.89. Перенос из anet
+сам по себе workspace.package.rust-version не повышает: MSRV уже 1.89, потому
+что Cargo.lock требует rustc 1.89 (time 0.3.55 — 1.88, uuid 1.29.0 — 1.89) и
+не понижается, а предстоящие зависимости rustls 0.23, quinn и h3 требуют тот
+же пол.
