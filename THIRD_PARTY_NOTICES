@@ -10,6 +10,6 @@ upstream — в LICENSES/anet-LICENSE.md.
 // Based on ZeroTworu/anet @0c0ffce: anet-common/src/padding_utils.rs
 Код при переносе адаптируется под edition 2021 и rustc 1.89. Перенос из anet
 сам по себе workspace.package.rust-version не повышает: MSRV уже 1.89, потому
-что Cargo.lock требует rustc 1.89 (time 0.3.55 — 1.88, uuid 1.29.0 — 1.89) и
-не понижается, а предстоящие зависимости rustls 0.23, quinn и h3 требуют тот
-же пол.
+что в Cargo.lock стоят uuid 1.29.0 (rust-version 1.89.0), time 0.3.55
+(rust-version 1.88.0) и rcgen 0.14.10 (rust-version 1.88). Понизить эти версии
+в lockfile технически можно; проект решил этого не делать.

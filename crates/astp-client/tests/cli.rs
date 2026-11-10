@@ -1,8 +1,8 @@
 use std::process::Command;
 
 fn command() -> Command {
-    // Cargo 1.85 exports the hyphenated target name. Underscore is the
-    // documented fallback if a newer Cargo rewrites the key.
+    // Cargo on the MSRV (Rust 1.89) exports the hyphenated target name.
+    // Underscore is the documented fallback if a newer Cargo rewrites the key.
     let path = option_env!("CARGO_BIN_EXE_astp-client")
         .or(option_env!("CARGO_BIN_EXE_astp_client"))
         .expect("Cargo did not export the astp-client executable path");
