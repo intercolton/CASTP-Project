@@ -1,12 +1,33 @@
 [package]
 name = "astp-crypto"
-description = "ASTP-M crypto crate (skeleton)"
+description = "ASTP-M TLS 1.3 configuration and authenticator contract"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Reference HMAC authenticator for tests of later tasks.
+# Not a default feature and not a production credential format.
+test-util = ["dep:ring", "dep:subtle"]
+
 [dependencies]
+astp-types.workspace = true
+thiserror.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+ring = { version = "0.17.14", optional = true }
+subtle = { version = "2.6.1", optional = true }
+
+[dev-dependencies]
+rcgen.workspace = true
+ring = { version = "0.17.14" }
+subtle = { version = "2.6.1" }
+tempfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

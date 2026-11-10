@@ -117,6 +117,19 @@ dependencies = [
 [[package]]
 name = "astp-crypto"
 version = "0.1.0"
+dependencies = [
+ "astp-types",
+ "rcgen",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots",
+]
 
 [[package]]
 name = "astp-frame"
