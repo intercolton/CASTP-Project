@@ -438,6 +438,58 @@ async fn dropped_pending_read_mid_payload_resumes_the_same_ping() {
     assert!(!frames.is_poisoned());
 }
 
+/// A frame larger than one 4 KiB chunk, cancelled on the chunk boundary,
+/// resumes the same frame and does not poison.
+#[tokio::test]
+async fn pending_at_4kib_boundary_resumes_the_same_frame() {
+    let frame = Frame {
+        key_epoch: None,
+        body: FrameBody::Disconnect {
+            code: 1,
+            reason: "z".repeat(8190),
+        },
+    };
+    let mut bytes = encode(&frame, None).unwrap();
+    bytes.extend(encode(&ping(3), None).unwrap());
+    let mut script = Script::chunked(bytes, 512).pending_once_at(8 + 4096);
+    let seen = script.counters();
+    let mut frames = FrameReader::new(&mut script);
+    {
+        let fut = frames.read_frame();
+        let mut fut = std::pin::pin!(fut);
+        drive_until_pending(fut.as_mut());
+    }
+    assert!(seen.pos.get() >= 8 + 4096);
+    assert!(!frames.is_poisoned());
+    assert_eq!(frames.read_frame().await.unwrap().unwrap(), frame);
+    assert_eq!(frames.read_frame().await.unwrap().unwrap(), ping(3));
+    assert!(!frames.is_poisoned());
+}
+
+#[tokio::test]
+async fn eof_at_4kib_boundary_is_incomplete_and_poisons() {
+    let frame = Frame {
+        key_epoch: None,
+        body: FrameBody::Disconnect {
+            code: 1,
+            reason: "z".repeat(8190),
+        },
+    };
+    let mut bytes = encode(&frame, None).unwrap();
+    bytes.truncate(8 + 4096);
+    let mut script = Script::chunked(bytes, 1024);
+    let mut frames = FrameReader::new(&mut script);
+    assert!(matches!(
+        frames.read_frame().await,
+        Err(FrameError::Incomplete)
+    ));
+    assert!(frames.is_poisoned());
+    assert!(matches!(
+        frames.read_frame().await,
+        Err(FrameError::Poisoned)
+    ));
+}
+
 /// F2: `ConnectionReset` after 3 bytes. The cursor stays at 3, and the
 /// next read does not touch the socket.
 #[tokio::test]

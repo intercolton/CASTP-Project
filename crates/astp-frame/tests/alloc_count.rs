@@ -4,10 +4,9 @@
 //! here does not affect the other tests. The `unsafe` impl is the
 //! `GlobalAlloc` contract and stays out of the library.
 //!
-//! On the reader this change replaced, the same counter reported 2
-//! allocations and 24 bytes of extra peak for every 16-byte PING, and
-//! 3 allocations and 120012 bytes of extra peak for a DISCONNECT whose
-//! reason is 60000 bytes.
+//! PR #9, same counter: every 16-byte PING was 1 allocation and 16 bytes
+//! of extra peak on the first frame, then 0. A DISCONNECT whose reason
+//! is 60000 bytes was 6 allocations and 125664 bytes of extra peak.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::future::Future;
@@ -19,6 +18,7 @@ use astp_frame::{encode, Frame, FrameBody, FrameReader};
 struct CountingAlloc;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static REALLOCS: AtomicUsize = AtomicUsize::new(0);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
@@ -57,6 +57,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
         // On success the old block is gone and the new block has `new_size` bytes.
         let new = unsafe { System.realloc(ptr, layout, new_size) };
         if !new.is_null() {
+            REALLOCS.fetch_add(1, Ordering::Relaxed);
             note_free(layout.size());
             note_alloc(new_size);
         }
@@ -75,18 +76,28 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 
 struct Sample {
     allocs: usize,
+    reallocs: usize,
     extra_peak: usize,
 }
 
 fn sample<T>(body: impl FnOnce() -> T) -> (T, Sample) {
     let base = LIVE.load(Ordering::Relaxed);
     ALLOCS.store(0, Ordering::Relaxed);
+    REALLOCS.store(0, Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
     let value = body();
     let allocs = ALLOCS.load(Ordering::Relaxed);
+    let reallocs = REALLOCS.load(Ordering::Relaxed);
     let peak = PEAK.load(Ordering::Relaxed);
     let extra_peak = peak.saturating_sub(base);
-    (value, Sample { allocs, extra_peak })
+    (
+        value,
+        Sample {
+            allocs,
+            reallocs,
+            extra_peak,
+        },
+    )
 }
 
 fn drive<T>(fut: impl Future<Output = T>) -> T {
@@ -127,6 +138,10 @@ fn small_frames_allocate_once_and_a_large_frame_drops_the_buffer() {
         "warmup ping: allocs={} extra_peak={}",
         warmup.allocs, warmup.extra_peak
     );
+    assert_eq!(
+        warmup.allocs, 1,
+        "the first small frame should allocate once"
+    );
 
     let mut steady = Vec::new();
     for i in 1..10u8 {
@@ -153,15 +168,15 @@ fn small_frames_allocate_once_and_a_large_frame_drops_the_buffer() {
     let (frame, large) = read_one(&mut frames);
     assert_eq!(frame, big);
     eprintln!(
-        "large frame: allocs={} extra_peak={}",
-        large.allocs, large.extra_peak
+        "large frame: allocs={} reallocs={} extra_peak={}",
+        large.allocs, large.reallocs, large.extra_peak
     );
     assert!(large.allocs >= 1, "large frame made no allocation");
     // One owned copy of the reason, plus the reader buffer, and not a
     // second full copy of that buffer at the same time.
     assert!(
-        large.extra_peak < 150_000,
-        "large frame peak {} looks like two full payload copies",
+        large.extra_peak < 125_000,
+        "large frame peak {} is above the single-buffer plus string ceiling",
         large.extra_peak
     );
 
@@ -183,4 +198,73 @@ fn small_frames_allocate_once_and_a_large_frame_drops_the_buffer() {
         reused.allocs, reused.extra_peak
     );
     assert_eq!(reused.allocs, 0, "the small buffer should be reused");
+    assert_eq!(large.reallocs, 1, "a large frame should grow exactly once");
+    assert_eq!(
+        large.allocs, 3,
+        "expected the first chunk, one exact reserve, and the decoded string"
+    );
+
+    // One test function: this binary's global allocator is process-wide,
+    // so a second `#[test]` would be counted inside this window.
+    payloads_4097_to_8192_do_not_reallocate_each_frame();
+    header_errors_and_overlong_encode_stay_small();
+}
+
+fn disconnect(payload: usize) -> Frame {
+    Frame {
+        key_epoch: None,
+        body: FrameBody::Disconnect {
+            code: 1,
+            reason: "x".repeat(payload - 2),
+        },
+    }
+}
+
+fn payloads_4097_to_8192_do_not_reallocate_each_frame() {
+    for payload in [4097usize, 6000, 8192] {
+        let frame = disconnect(payload);
+        let once = encode(&frame, None).unwrap();
+        let mut bytes = Vec::new();
+        for _ in 0..4 {
+            bytes.extend_from_slice(&once);
+        }
+        let mut frames = FrameReader::new(std::io::Cursor::new(bytes));
+        let (first, warm) = read_one(&mut frames);
+        assert_eq!(first, frame);
+        eprintln!(
+            "medium {payload} warmup: allocs={} reallocs={} extra_peak={}",
+            warm.allocs, warm.reallocs, warm.extra_peak
+        );
+        for i in 1..4 {
+            let (got, sample) = read_one(&mut frames);
+            assert_eq!(got, frame);
+            eprintln!(
+                "medium {payload} frame {i}: allocs={} reallocs={} extra_peak={}",
+                sample.allocs, sample.reallocs, sample.extra_peak
+            );
+            assert_eq!(
+                sample.reallocs, 0,
+                "payload {payload} frame {i} reallocated the buffer"
+            );
+        }
+    }
+}
+
+fn header_errors_and_overlong_encode_stay_small() {
+    let too_long = vec![0x01u8, 0x01, 0, 0, 0x00, 0x01, 0x00, 0x00];
+    let mut frames = FrameReader::new(std::io::Cursor::new(too_long));
+    let (_, header) = sample(|| drive(frames.read_frame()));
+    assert!(
+        header.extra_peak < 4096,
+        "header error peak {}",
+        header.extra_peak
+    );
+
+    let huge = disconnect(70_000);
+    let (_, encoded) = sample(|| encode(&huge, None));
+    assert!(
+        encoded.extra_peak < 4096,
+        "encode peak {}",
+        encoded.extra_peak
+    );
 }

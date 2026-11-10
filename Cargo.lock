@@ -136,6 +136,7 @@ name = "astp-frame"
 version = "0.1.0"
 dependencies = [
  "astp-types",
+ "bytes",
  "rand 0.9.5",
  "thiserror",
  "tokio",

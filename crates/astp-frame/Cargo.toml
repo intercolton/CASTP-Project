@@ -8,6 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 astp-types.workspace = true
+# `BufMut::limit` so a payload read can use spare capacity without
+# zero-filling it. The crate is already in the workspace lock.
+bytes.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 # The codec uses AsyncRead (io-util). macros/rt are for tests and doctests.
