@@ -8,9 +8,9 @@
 
 Проект лицензирован под MIT. Текст лицензии — в файле `LICENSE`.
 
-Отдельные идеи и, позже, отдельные куски кода могут опираться на [ZeroTworu/anet](https://github.com/ZeroTworu/anet) @ `0c0ffce`. Проводной совместимости с anet нет, форка репозитория anet нет. Лицензия anet — `LICENSES/anet-LICENSE.md`. Строка атрибуции: `Based on ZeroTworu/anet @0c0ffce` (см. `THIRD_PARTY_NOTICES`). Любой позже перенесённый из anet файл, даже переписанный по мотивам, обязан содержать в заголовке источник и SHA, например `// Based on ZeroTworu/anet @0c0ffce: anet-common/src/padding_utils.rs`. Такой код адаптируется под edition 2021 и rustc 1.85; `workspace.package.rust-version` из-за этого не повышается.
+Отдельные идеи и, позже, отдельные куски кода могут опираться на [ZeroTworu/anet](https://github.com/ZeroTworu/anet) @ `0c0ffce`. Проводной совместимости с anet нет, форка репозитория anet нет. Лицензия anet — `LICENSES/anet-LICENSE.md`. Строка атрибуции: `Based on ZeroTworu/anet @0c0ffce` (см. `THIRD_PARTY_NOTICES`). Любой позже перенесённый из anet файл, даже переписанный по мотивам, обязан содержать в заголовке источник и SHA, например `// Based on ZeroTworu/anet @0c0ffce: anet-common/src/padding_utils.rs`. Такой код адаптируется под edition 2021 и rustc 1.89. Перенос из anet сам по себе `workspace.package.rust-version` не повышает.
 
-Toolchain — Rust 1.85, edition 2021. Это не Rust 1.98 и не edition 2024.
+Toolchain — Rust 1.89 (MSRV), edition 2021. Это не Rust 1.98 и не edition 2024. MSRV поднят с 1.85, потому что в `Cargo.lock` стоят `uuid` 1.29.0 (`rust-version` 1.89.0), `time` 0.3.55 (`rust-version` 1.88.0) и `rcgen` 0.14.10 (`rust-version` 1.88). Понизить эти версии в lockfile технически можно; проект решил этого не делать.
 
 Эталон сборки и CI — Ubuntu 24.04 x86_64. Целевой сервер v1 — Linux VPS с ядром не ниже 5.15, архитектуры x86_64 и aarch64: основной артефакт — musl и Docker, запасной — glibc. Туннельный режим требует `/dev/net/tun` и `CAP_NET_ADMIN`. Параллельный каскад (два сервера) в v1 не входит. Этот каркас не содержит платформенных зависимостей, Docker-образа VPN и CI-матрицы.
 
