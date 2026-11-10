@@ -1,0 +1,12 @@
+[package]
+name = "astp-transport"
+description = "ASTP-M transport crate (skeleton)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

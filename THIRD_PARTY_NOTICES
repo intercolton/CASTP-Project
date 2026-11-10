@@ -1,0 +1,12 @@
+Based on ZeroTworu/anet @0c0ffce
+
+Берём идеи и отдельные куски кода из https://github.com/ZeroTworu/anet
+(коммит 0c0ffce80e2cf25cb3da201b21edc3db18ff8875). Проводной совместимости
+с anet нет, форка репозитория anet нет. Полный текст декларации лицензии
+upstream — в LICENSES/anet-LICENSE.md.
+
+Любой позже перенесённый из anet файл (даже переписанный по мотивам)
+обязан содержать в заголовке источник и SHA, например:
+// Based on ZeroTworu/anet @0c0ffce: anet-common/src/padding_utils.rs
+Код при переносе адаптируется под edition 2021 и rustc 1.85, без повышения
+workspace.package.rust-version.

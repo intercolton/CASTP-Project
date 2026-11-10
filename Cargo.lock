@@ -107,6 +107,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "astp-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+]
+
+[[package]]
+name = "astp-crypto"
+version = "0.1.0"
+
+[[package]]
+name = "astp-frame"
+version = "0.1.0"
+
+[[package]]
+name = "astp-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+]
+
+[[package]]
+name = "astp-session"
+version = "0.1.0"
+
+[[package]]
+name = "astp-transport"
+version = "0.1.0"
+
+[[package]]
+name = "astp-tun"
+version = "0.1.0"
+
+[[package]]
+name = "astp-types"
+version = "0.1.0"
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

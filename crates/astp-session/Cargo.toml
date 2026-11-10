@@ -1,0 +1,12 @@
+[package]
+name = "astp-session"
+description = "ASTP-M session crate (skeleton)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
