@@ -6,18 +6,34 @@ members = [
     "crates/probe-server",
     "crates/probe-analyzer",
     "crates/probe-report",
+    "crates/astp-types",
+    "crates/astp-frame",
+    "crates/astp-crypto",
+    "crates/astp-transport",
+    "crates/astp-session",
+    "crates/astp-tun",
+    "crates/astp-client",
+    "crates/astp-server",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
 probe-common = { path = "crates/probe-common" }
 probe-analyzer = { path = "crates/probe-analyzer" }
 probe-report = { path = "crates/probe-report" }
+astp-types = { path = "crates/astp-types" }
+astp-frame = { path = "crates/astp-frame" }
+astp-crypto = { path = "crates/astp-crypto" }
+astp-transport = { path = "crates/astp-transport" }
+astp-session = { path = "crates/astp-session" }
+astp-tun = { path = "crates/astp-tun" }
+astp-client = { path = "crates/astp-client" }
+astp-server = { path = "crates/astp-server" }
 
 anyhow = "1"
 thiserror = "2"
