@@ -16,7 +16,11 @@ use crate::error::FrameError;
 use crate::wire::{copy_exact, copy_prefix};
 
 /// One CONFIG or ROUTE_UPDATE record.
+///
+/// The enum is `non_exhaustive`: adding a variant later is not a breaking
+/// change for downstream `match`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Tlv {
     /// `addr4`: IPv4 address and prefix length `0..=32`.
     Addr4 {
@@ -155,6 +159,55 @@ pub(crate) fn encode_tlv_list(tlvs: &[Tlv], out: &mut Vec<u8>) -> Result<(), Fra
         encode_one(tlv, out)?;
     }
     Ok(())
+}
+
+// Wire length of `tlvs`, including each 4-byte header. Same checks as
+// `encode_tlv_list`, without copying the values.
+pub(crate) fn encoded_tlvs_len(tlvs: &[Tlv]) -> Result<usize, FrameError> {
+    let mut total = 0usize;
+    for tlv in tlvs {
+        total = total.saturating_add(encoded_one_len(tlv)?);
+    }
+    Ok(total)
+}
+
+fn encoded_one_len(tlv: &Tlv) -> Result<usize, FrameError> {
+    let value_len = match tlv {
+        Tlv::Addr4 { prefix, .. } => {
+            check_prefix(TLV_ADDR4, *prefix, 32)?;
+            5
+        }
+        Tlv::Addr6 { prefix, .. } => {
+            check_prefix(TLV_ADDR6, *prefix, 128)?;
+            17
+        }
+        Tlv::Mtu(_) => 2,
+        Tlv::Dns4(_) => 4,
+        Tlv::Dns6(_) => 16,
+        Tlv::Route4 { prefix, .. } => {
+            check_prefix(TLV_ROUTE4, *prefix, 32)?;
+            6
+        }
+        Tlv::Route6 { prefix, .. } => {
+            check_prefix(TLV_ROUTE6, *prefix, 128)?;
+            18
+        }
+        Tlv::Keepalive(_) | Tlv::IdleTimeout(_) | Tlv::MaxFrame(_) => 4,
+        Tlv::SessionId(_) => 16,
+        Tlv::Raw { ty, value } => {
+            if is_known_tlv(*ty) {
+                return Err(FrameError::KnownTlvAsRaw { ty: *ty });
+            }
+            if u16::try_from(value.len()).is_err() {
+                return Err(FrameError::TlvValueTooLong {
+                    ty: *ty,
+                    length: value.len(),
+                });
+            }
+            value.len()
+        }
+    };
+    Ok(4usize.saturating_add(value_len))
 }
 
 fn decode_one(ty: u16, value: &[u8]) -> Result<Tlv, FrameError> {

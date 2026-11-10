@@ -9,7 +9,7 @@ use astp_frame::{
 
 fn hex(text: &str) -> Vec<u8> {
     let digits: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    assert!(digits.len() % 2 == 0, "odd hex length in {text}");
+    assert!(digits.len().is_multiple_of(2), "odd hex length in {text}");
     (0..digits.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&digits[i..i + 2], 16).expect("hex"))

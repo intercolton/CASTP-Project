@@ -6,7 +6,9 @@ use astp_types::{
     FRAME_WINDOW, MAX_FRAME_LENGTH,
 };
 
-use crate::config::{decode_config, decode_tlv_list, encode_config, encode_tlv_list};
+use crate::config::{
+    decode_config, decode_tlv_list, encode_config, encode_tlv_list, encoded_tlvs_len,
+};
 use crate::error::FrameError;
 use crate::header::{push_header, DecodeLimits, RawHeader};
 use crate::types::{decode_ipv4, decode_ipv6, validate_ipv4, validate_ipv6, Frame, FrameBody};
@@ -67,8 +69,9 @@ pub fn decode(buf: &[u8]) -> Result<Frame, FrameError> {
 /// exactly `8 + Length` bytes”, then padding, then the key-epoch byte,
 /// then the type. An illegal `Length` is rejected before the payload is
 /// required to be present, so a 65536-byte claim does not allocate.
-/// [`crate::FrameReader`] checks `Length` first instead, because a stream
-/// still has to decide whether the payload may be read.
+/// [`crate::FrameReader`] checks `Length` first. A version or flag error
+/// on that stream does not read the payload either: the reader is
+/// poisoned and the connection must be closed.
 ///
 /// # Errors
 ///
@@ -104,7 +107,60 @@ pub(crate) fn encoded_content(frame: &Frame) -> Result<Vec<u8>, FrameError> {
     Ok(content)
 }
 
+/// Length of the unpadded content, including the key-epoch byte.
+///
+/// Same validation as [`encoded_content`], without copying the body.
+pub(crate) fn encoded_content_len(frame: &Frame) -> Result<usize, FrameError> {
+    let epoch = usize::from(frame.key_epoch.is_some());
+    Ok(epoch.saturating_add(body_len(&frame.body)?))
+}
+
+fn body_len(body: &FrameBody) -> Result<usize, FrameError> {
+    match body {
+        FrameBody::Padding => Ok(0),
+        FrameBody::Ping(_) | FrameBody::Pong(_) => Ok(8),
+        FrameBody::TunIpv4(packet) => {
+            validate_ipv4(packet.as_bytes())?;
+            Ok(packet.as_bytes().len())
+        }
+        FrameBody::TunIpv6(packet) => {
+            validate_ipv6(packet.as_bytes())?;
+            Ok(packet.as_bytes().len())
+        }
+        FrameBody::Config(cfg) => Ok(4usize.saturating_add(encoded_tlvs_len(&cfg.tlvs)?)),
+        FrameBody::ConfigAck { .. } => Ok(5),
+        FrameBody::RouteUpdate(update) => encoded_tlvs_len(&update.tlvs),
+        FrameBody::Disconnect { reason, .. } => Ok(2usize.saturating_add(reason.len())),
+        FrameBody::Window { .. } => Ok(4),
+    }
+}
+
+// Payload length after padding. Validation errors match `assemble`
+// and are returned before the body is copied.
+fn declared_payload_len(frame: &Frame, pad_octets: Option<&[u8]>) -> Result<usize, FrameError> {
+    let mut len = encoded_content_len(frame)?;
+    if let Some(octets) = pad_octets {
+        u16::try_from(octets.len()).map_err(|_| FrameError::BadPadding)?;
+        len = len.saturating_add(octets.len()).saturating_add(2);
+    }
+    Ok(len)
+}
+
+fn frame_too_long(length: usize) -> FrameError {
+    FrameError::FrameTooLong {
+        length: u32::try_from(length).unwrap_or(u32::MAX),
+        max_frame: MAX_FRAME_LENGTH,
+    }
+}
+
 fn assemble(frame: &Frame, pad_octets: Option<&[u8]>) -> Result<Vec<u8>, FrameError> {
+    // Refuse before copying a body that cannot fit. Validation errors
+    // (bad prefix, bad IP, raw TLV of a known type, pad that does not
+    // fit in a `u16`) still win over `FrameTooLong`.
+    let declared = declared_payload_len(frame, pad_octets)?;
+    if declared > usize::try_from(MAX_FRAME_LENGTH).unwrap_or(usize::MAX) {
+        return Err(frame_too_long(declared));
+    }
     let mut payload = encoded_content(frame)?;
     let mut flags = 0u16;
     if frame.key_epoch.is_some() {

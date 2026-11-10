@@ -14,14 +14,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::codec::decode_with;
 use crate::error::FrameError;
-use crate::header::{DecodeLimits, HeaderFault, RawHeader};
+use crate::header::{DecodeLimits, RawHeader};
 use crate::types::Frame;
-
-/// Scratch size for discarding a payload that will not be decoded.
-///
-/// The discarded bytes are not stored. A legal frame is at most 65535
-/// bytes, so this only bounds how much one poll pulls.
-const DISCARD_CHUNK: usize = 512;
 
 /// What one step of the read state machine decided.
 enum Step {
@@ -39,9 +33,6 @@ enum Stage {
     Ready,
     /// `header_filled` bytes of the header are stored.
     Header,
-    /// `Length` is legal and the header is not. Discard the payload,
-    /// then return this fault.
-    Discard(HeaderFault),
     /// `payload_filled` bytes of a payload that passed the length cap
     /// are stored.
     Payload,
@@ -79,27 +70,35 @@ enum Stage {
 /// before the first byte of a frame, does not poison. A session that
 /// sees `Err` closes the connection. It does not keep reading frames.
 ///
+/// # Header errors
+///
+/// Any error taken from the 8-byte header poisons the reader, and the
+/// connection must be closed. The payload is not allocated, not read,
+/// and not discarded. The cursor stays on the first unread byte after
+/// the header (or earlier, if the header itself was short). This reader
+/// does not resynchronize, and it does not promise that the cursor is
+/// on a later frame boundary.
+///
+/// `Length` is checked before version and flags. An overlong `Length`
+/// is [`FrameError::FrameTooLong`], including when the version is
+/// unknown or reserved flags are set. [`FrameError::UnknownVersion`]
+/// and [`FrameError::ReservedFlags`] are returned only when `Length`
+/// is within the limit, and they are returned as soon as the header
+/// is complete. When both the version and the flags are wrong, the
+/// version error is the one returned. A `Length` of zero has no
+/// payload bytes; the reader is still poisoned.
+///
 /// # Alignment
 ///
 /// Poison always stops this reader. It does not always leave the socket
 /// mid-frame. Here "aligned" means the cursor is on a frame boundary:
 /// the next byte would be the first byte of a later frame, or the stream
-/// is at EOF.
+/// is at EOF. Header errors are not aligned.
 ///
-/// * [`FrameError::FrameTooLong`] never allocates the payload and never
-///   reads it. This includes a header whose version is unknown or whose
-///   reserved flags are set. `Length` is checked before version and
-///   flags, so an overlong header is `FrameTooLong` and not
-///   [`FrameError::UnknownVersion`] or [`FrameError::ReservedFlags`].
-///   The cursor stays immediately after the 8-byte header. Not aligned.
-/// * [`FrameError::UnknownVersion`] and [`FrameError::ReservedFlags`]
-///   are returned only when `Length` is within the limit. The payload
-///   is read and discarded first, then the error is returned, and the
-///   cursor is aligned. A `Length` of zero discards nothing and is
-///   still aligned. When both the version and the flags are wrong, the
-///   version error is the one returned. If the discard hits EOF or an
-///   I/O error, that error is returned instead and the cursor is not
-///   aligned.
+/// * [`FrameError::FrameTooLong`], [`FrameError::UnknownVersion`], and
+///   [`FrameError::ReservedFlags`] never allocate the payload and never
+///   read it. The cursor stays immediately after the 8-byte header.
+///   Not aligned. The connection must be closed.
 /// * [`FrameError::Io`] or [`FrameError::Incomplete`] while the header
 ///   or the payload is still short: not aligned. Bytes already stored
 ///   are dropped with the poison. They are not reused as a new header.
@@ -110,6 +109,14 @@ enum Stage {
 /// * A body, padding, type, or TLV error after all `8 + Length` bytes
 ///   have been read: the cursor is aligned, and the reader is still
 ///   poisoned. The following frame is not parsed.
+///
+/// # Buffer
+///
+/// The payload allocation is released when a frame finishes, on success
+/// or on poison, so an idle connection does not keep the last payload
+/// (up to 64 KiB). Dropping [`Self::read_frame`] at `Pending` does not
+/// release a partial payload: those bytes still belong to the current
+/// frame.
 ///
 /// One-shot [`crate::decode`] checks version, then flags, then length.
 /// That buffer is already in memory, so the order cannot desynchronize
@@ -131,7 +138,6 @@ pub struct FrameReader<R> {
     header_filled: usize,
     payload: Vec<u8>,
     payload_filled: usize,
-    discard_remaining: usize,
 }
 
 impl<R> FrameReader<R> {
@@ -157,7 +163,6 @@ impl<R> FrameReader<R> {
             header_filled: 0,
             payload: Vec::new(),
             payload_filled: 0,
-            discard_remaining: 0,
         }
     }
 
@@ -189,7 +194,6 @@ impl<R> FrameReader<R> {
         self.header_filled = 0;
         self.payload = Vec::new();
         self.payload_filled = 0;
-        self.discard_remaining = 0;
     }
 
     fn fail(&mut self, err: FrameError) -> Step {
@@ -201,7 +205,6 @@ impl<R> FrameReader<R> {
         self.header = [0; FRAME_HEADER_LEN];
         self.header_filled = 0;
         self.payload_filled = 0;
-        self.discard_remaining = 0;
         self.stage = Stage::Header;
         Step::Continue
     }
@@ -220,11 +223,9 @@ impl<R> FrameReader<R> {
         };
         match header.version_and_flags() {
             Ok(()) => self.start_payload(length),
-            Err(fault) => {
-                self.discard_remaining = length;
-                self.stage = Stage::Discard(fault);
-                Step::Continue
-            }
+            // Do not read the payload. The reader is poisoned and the
+            // connection must be closed.
+            Err(fault) => self.fail(fault.into_error()),
         }
     }
 
@@ -281,9 +282,10 @@ impl<R> FrameReader<R> {
         }
         buf.extend_from_slice(&self.header);
         buf.extend_from_slice(&self.payload);
-        // The frame bytes are in `buf`. Drop the copy held here before
-        // decode so a poisoned reader does not keep a TUN payload.
-        self.payload.clear();
+        // The frame bytes are in `buf`. Replace the payload vec, rather
+        // than `clear`, so the capacity is released too. `clear` would
+        // leave an idle connection holding the last frame (up to 64 KiB).
+        self.payload = Vec::new();
         self.payload_filled = 0;
         self.header_filled = 0;
         match decode_with(&buf, self.limits) {
@@ -303,8 +305,8 @@ where
     /// Read the next frame.
     ///
     /// `Ok(None)` is a clean EOF before the first byte of a frame. Any
-    /// `Err` poisons this reader; see [`FrameReader`] for which errors
-    /// discard a legal payload and which leave the cursor mid-frame.
+    /// `Err` poisons this reader. The connection must be closed. A
+    /// header error does not read the payload; see [`FrameReader`].
     ///
     /// # Cancel safety
     ///
@@ -318,11 +320,11 @@ where
     /// flags are also illegal.
     ///
     /// [`FrameError::UnknownVersion`] or [`FrameError::ReservedFlags`]
-    /// after a legal payload has been discarded.
+    /// once the header is complete and `Length` is within the limit.
+    /// The payload is not read.
     ///
     /// [`FrameError::Incomplete`] if EOF arrives after at least one byte
-    /// of this frame, or before a declared payload (including a discard)
-    /// is complete.
+    /// of this frame, or before a declared payload is complete.
     ///
     /// [`FrameError::Io`] if the socket fails mid-frame.
     ///
@@ -354,7 +356,6 @@ where
                 Stage::Poisoned => return Poll::Ready(Err(FrameError::Poisoned)),
                 Stage::Ready => self.begin_header(),
                 Stage::Header => self.poll_header(cx),
-                Stage::Discard(fault) => self.poll_discard(cx, fault),
                 Stage::Payload => self.poll_payload(cx),
             };
             match step {
@@ -388,29 +389,6 @@ where
             Poll::Ready(Ok(n)) => self.take_payload_bytes(n),
         }
     }
-
-    fn poll_discard(&mut self, cx: &mut Context<'_>, fault: HeaderFault) -> Step {
-        if self.discard_remaining == 0 {
-            let err = fault.into_error();
-            return self.fail(err);
-        }
-        let want = self.discard_remaining.min(DISCARD_CHUNK);
-        let mut scratch = [0u8; DISCARD_CHUNK];
-        match poll_read_some(&mut self.reader, cx, &mut scratch[..want]) {
-            Poll::Pending => Step::Wait,
-            Poll::Ready(Err(err)) => self.fail(err),
-            Poll::Ready(Ok(0)) => self.fail(FrameError::Incomplete),
-            Poll::Ready(Ok(n)) => {
-                self.discard_remaining = self.discard_remaining.saturating_sub(n);
-                if self.discard_remaining == 0 {
-                    let err = fault.into_error();
-                    self.fail(err)
-                } else {
-                    Step::Continue
-                }
-            }
-        }
-    }
 }
 
 impl<R> fmt::Debug for FrameReader<R> {
@@ -422,7 +400,6 @@ impl<R> fmt::Debug for FrameReader<R> {
             .field("header_filled", &self.header_filled)
             .field("payload_filled", &self.payload_filled)
             .field("payload_len", &self.payload.len())
-            .field("discard_remaining", &self.discard_remaining)
             .finish_non_exhaustive()
     }
 }
@@ -444,5 +421,39 @@ where
         Poll::Pending => Poll::Pending,
         Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
         Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameReader;
+    use crate::{encode, Frame, FrameBody};
+
+    #[tokio::test]
+    async fn large_frame_releases_the_payload_allocation() {
+        let big = Frame {
+            key_epoch: None,
+            body: FrameBody::Disconnect {
+                code: 7,
+                reason: "x".repeat(60_000),
+            },
+        };
+        let small = Frame {
+            key_epoch: None,
+            body: FrameBody::Padding,
+        };
+        let mut bytes = encode(&big, None).unwrap();
+        bytes.extend(encode(&small, None).unwrap());
+        let mut frames = FrameReader::new(std::io::Cursor::new(bytes));
+        assert_eq!(frames.read_frame().await.unwrap().unwrap(), big);
+        assert_eq!(
+            frames.payload.capacity(),
+            0,
+            "an idle reader must not keep the previous payload allocation"
+        );
+        assert_eq!(frames.read_frame().await.unwrap().unwrap(), small);
+        assert_eq!(frames.payload.capacity(), 0);
+        assert!(frames.read_frame().await.unwrap().is_none());
+        assert!(!frames.is_poisoned());
     }
 }
