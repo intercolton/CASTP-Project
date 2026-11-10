@@ -166,7 +166,8 @@ impl Service {
         let mut ev = self.event(&req, TestType::LongSession);
         ev.detail = Some("direction=up".into());
         let started = Instant::now();
-        let deadline = Duration::from_secs(seconds.saturating_add(self.limits.idle_timeout_seconds));
+        let deadline =
+            Duration::from_secs(seconds.saturating_add(self.limits.idle_timeout_seconds));
         let mut received = 0u64;
         let mut body = req.into_body();
         let read = async {
@@ -190,11 +191,7 @@ impl Service {
             Phase::HandshakeDone
         });
         let (status, msg, ev) = match outcome {
-            Ok(Ok(())) if received > 0 => (
-                StatusCode::OK,
-                format!("{received}\n"),
-                ev.succeed(),
-            ),
+            Ok(Ok(())) if received > 0 => (StatusCode::OK, format!("{received}\n"), ev.succeed()),
             Ok(Ok(())) => (
                 StatusCode::BAD_REQUEST,
                 "empty upload\n".into(),
