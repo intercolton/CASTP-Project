@@ -28,7 +28,11 @@ pub struct Frame {
 /// There is no variant for an unknown type. Reserved codes `0x40..=0x4F`
 /// are unknown types and fail at decode. Unknown CONFIG TLV records use
 /// [`crate::Tlv::Raw`] instead of failing the frame.
+///
+/// The enum is `non_exhaustive`: adding a variant later is not a breaking
+/// change for downstream `match`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameBody {
     /// `PADDING`. The body is empty.
     Padding,

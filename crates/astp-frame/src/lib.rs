@@ -25,10 +25,11 @@
 //!   that ceiling. A larger stored value does not raise it.
 //! * [`FrameReader`] checks `Length` before it allocates or reads the
 //!   payload, so an overlong header does not reserve a multi-megabyte
-//!   buffer. Partial reads stay in the reader across cancellation. Any
-//!   error poisons it; a later read does not touch the socket. See
-//!   [`FrameReader`] for which of those errors leave the cursor on a
-//!   frame boundary.
+//!   buffer. An unknown version or reserved flags also poison the
+//!   reader without reading the payload. Partial reads stay in the
+//!   reader across cancellation. Any error poisons it; a later read
+//!   does not touch the socket, and the connection must be closed.
+//!   A header error does not leave the cursor on a frame boundary.
 //! * Untrusted bytes produce [`FrameError`]. Library paths do not panic on
 //!   a short, malformed, or overlong frame, and they do not log TUN payloads.
 //!

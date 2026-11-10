@@ -298,6 +298,31 @@ fn camouflage_rng_path_round_trips_without_a_fixed_pad() {
 }
 
 #[test]
+fn overlong_disconnect_is_rejected_before_the_body_is_copied() {
+    let frame = Frame {
+        key_epoch: None,
+        body: FrameBody::Disconnect {
+            code: 1,
+            reason: "x".repeat(65_534),
+        },
+    };
+    assert!(matches!(
+        encode(&frame, None),
+        Err(FrameError::FrameTooLong {
+            length: 65_536,
+            max_frame: 65_535
+        })
+    ));
+    assert!(matches!(
+        encode_camouflage(&frame),
+        Err(FrameError::FrameTooLong {
+            max_frame: 65_535,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn padding_that_does_not_fit_in_the_length_field_is_rejected() {
     let frame = Frame {
         key_epoch: None,

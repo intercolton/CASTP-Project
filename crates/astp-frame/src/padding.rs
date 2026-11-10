@@ -7,7 +7,7 @@
 
 use astp_types::{DEFAULT_MAX_PAD, DEFAULT_MIN_WIRE_SIZE, DEFAULT_PADDING_STEP, MAX_FRAME_LENGTH};
 
-use crate::codec::{encode_to, encoded_content};
+use crate::codec::{encode_to, encoded_content_len};
 use crate::error::FrameError;
 use crate::types::Frame;
 
@@ -135,9 +135,11 @@ pub fn encode_camouflage_with(
     profile: &CamouflageProfile,
     mut fill: impl FnMut(&mut [u8]) -> Result<(), FrameError>,
 ) -> Result<Vec<u8>, FrameError> {
-    let content = encoded_content(frame)?;
+    // Length before the body is copied. A disconnect reason (or any
+    // other body) past 65535 never becomes a `Vec`.
+    let content_len = encoded_content_len(frame)?;
     let decided = camouflage_pad_len(
-        content.len(),
+        content_len,
         profile.padding_step,
         profile.min_wire_size,
         profile.max_pad,
@@ -145,10 +147,7 @@ pub fn encode_camouflage_with(
     let pad = match decided {
         None => None,
         Some(n) => {
-            let total = content
-                .len()
-                .saturating_add(usize::from(n))
-                .saturating_add(2);
+            let total = content_len.saturating_add(usize::from(n)).saturating_add(2);
             if total > usize::try_from(MAX_FRAME_LENGTH).unwrap_or(usize::MAX) {
                 return Err(FrameError::FrameTooLong {
                     length: u32::try_from(total).unwrap_or(u32::MAX),
