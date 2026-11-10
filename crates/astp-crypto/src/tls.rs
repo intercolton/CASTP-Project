@@ -188,12 +188,24 @@ pub enum CryptoError {
         /// rustls error text.
         detail: String,
     },
+
+    /// The server certificate key or the mTLS client key is not Ed25519
+    /// or ECDSA P-256.
+    ///
+    /// This does not apply to certificates we only verify. A public CA
+    /// chain may still use RSA or P-384.
+    #[error("own TLS key must be Ed25519 or ECDSA P-256, got {algorithm}")]
+    UnsupportedOwnKey {
+        /// `ecdsa-p384`, `rsa`, or `unsupported`. Not key material.
+        algorithm: &'static str,
+    },
 }
 
 /// Build a TLS 1.3 server config.
 ///
 /// ALPN is [`SERVER_ALPN`]. Early data is disabled. Client authentication
-/// is disabled unless `client_auth` is [`ClientAuth::Required`].
+/// is disabled unless `client_auth` is [`ClientAuth::Required`]. The
+/// server's own key must be Ed25519 or ECDSA P-256.
 pub fn server_config(options: ServerOptions) -> Result<Arc<rustls::ServerConfig>, CryptoError> {
     let provider = provider();
     let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
@@ -234,6 +246,8 @@ pub fn server_config(options: ServerOptions) -> Result<Arc<rustls::ServerConfig>
 /// The server name is checked while the config is built, including the
 /// IP-literal rule. Pass [`ClientOptions::server_name`] to the connector.
 /// Early data is disabled. There is no option to skip certificate checks.
+/// An mTLS client key, when set, must be Ed25519 or ECDSA P-256. Peer
+/// chains are verified with the ring provider's default algorithms.
 pub fn client_config(options: ClientOptions) -> Result<Arc<rustls::ClientConfig>, CryptoError> {
     // The name is not stored on ClientConfig. Rejecting it here means an
     // IP dial without tls_server_name never produces a usable config.
@@ -269,6 +283,10 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     // panics when none is installed. Installing one from a library would
     // change every other rustls user in the process. The provider is passed
     // in, and TLS 1.3 is still the only version on the config.
+    //
+    // `signature_verification_algorithms` stays at the ring default. Peer
+    // chains (a public CA, including P-384 or RSA intermediates) are not
+    // filtered. The Ed25519 / P-256 limit applies only to keys we load.
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
@@ -319,6 +337,45 @@ fn load_identity(
             }
             Ok((certificates, private_key))
         }
+    }
+    .and_then(|(certificates, private_key)| {
+        ensure_own_key(&private_key)?;
+        Ok((certificates, private_key))
+    })
+}
+
+/// Rule D applies to keys we sign with, not to chains we verify.
+fn ensure_own_key(key: &PrivateKeyDer<'static>) -> Result<(), CryptoError> {
+    let loaded = provider()
+        .key_provider
+        .load_private_key(key.clone_key())
+        .map_err(|err| CryptoError::InvalidIdentity {
+            detail: err.to_string(),
+        })?;
+    if loaded
+        .choose_scheme(&[
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+        ])
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(CryptoError::UnsupportedOwnKey {
+        algorithm: disallowed_own_key_name(loaded.as_ref()),
+    })
+}
+
+fn disallowed_own_key_name(key: &dyn rustls::sign::SigningKey) -> &'static str {
+    if key
+        .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP384_SHA384])
+        .is_some()
+    {
+        "ecdsa-p384"
+    } else if key.algorithm() == rustls::SignatureAlgorithm::RSA {
+        "rsa"
+    } else {
+        "unsupported"
     }
 }
 

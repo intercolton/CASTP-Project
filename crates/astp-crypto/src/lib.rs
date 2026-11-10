@@ -18,6 +18,9 @@
 //!   the same list. A TCP client offers [`TCP_ALPN`] (`h2` only).
 //!   `astp-m/1` is not offered.
 //! * mTLS is off unless [`ClientAuth::Required`] is set.
+//! * Our own keys (the server certificate and the optional mTLS client
+//!   key) must be Ed25519 or ECDSA P-256. Peer chains are not filtered,
+//!   so a public CA may still use RSA or P-384.
 //! * Channel binding is the TLS 1.3 exporter [`CHANNEL_BINDING_LABEL`],
 //!   [`CHANNEL_BINDING_LEN`] bytes, with an empty context (`None`).
 //!

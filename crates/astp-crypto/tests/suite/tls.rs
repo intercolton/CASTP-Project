@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::RootCertStore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -818,6 +819,75 @@ async fn ed25519_and_p256_certificates_are_accepted() {
         expect_handshake(&issued, false, label).await;
         expect_handshake(&issued, true, label).await;
     }
+}
+
+#[test]
+fn rsa_and_p384_own_keys_are_rejected() {
+    let p384 = issue(&rcgen::PKCS_ECDSA_P384_SHA384);
+    assert_own_key_rejected(&p384, "ecdsa-p384");
+
+    // Throwaway RSA key generated for this test. It is not a credential.
+    let cert =
+        CertificateDer::from_pem_slice(include_bytes!("rsa-own-cert.fixture")).expect("rsa cert");
+    let key =
+        PrivateKeyDer::from_pem_slice(include_bytes!("rsa-own-key.fixture")).expect("rsa key");
+    let rsa = Issued {
+        ca_der: cert.clone(),
+        leaf_cert: cert.clone(),
+        leaf_key: key.clone_key(),
+        client_cert: cert,
+        client_key: key,
+        leaf_pem: String::new(),
+        leaf_key_pem: String::new(),
+    };
+    assert_own_key_rejected(&rsa, "rsa");
+
+    let allowed = issue(&rcgen::PKCS_ECDSA_P256_SHA256);
+    let client = client_config(client_options(
+        roots_of(&allowed.ca_der),
+        "astp.test",
+        None,
+        AlpnMode::Tcp,
+        None,
+    ))
+    .expect("p256 client");
+    let schemes = client
+        .crypto_provider()
+        .signature_verification_algorithms
+        .mapping;
+    assert!(schemes
+        .iter()
+        .any(|(scheme, _)| *scheme == rustls::SignatureScheme::ECDSA_NISTP384_SHA384));
+    assert!(schemes
+        .iter()
+        .any(|(scheme, _)| *scheme == rustls::SignatureScheme::RSA_PKCS1_SHA256));
+}
+
+fn assert_own_key_rejected(issued: &Issued, algorithm: &'static str) {
+    let server_err = server_config(ServerOptions {
+        identity: server_identity(issued),
+        client_auth: None,
+    })
+    .expect_err("server accepted a disallowed own key");
+    assert_eq!(
+        server_err,
+        CryptoError::UnsupportedOwnKey { algorithm },
+        "server"
+    );
+
+    let client_err = client_config(client_options(
+        roots_of(&issued.ca_der),
+        "astp.test",
+        None,
+        AlpnMode::Tcp,
+        Some(mtls_identity(issued)),
+    ))
+    .expect_err("mTLS client accepted a disallowed own key");
+    assert_eq!(
+        client_err,
+        CryptoError::UnsupportedOwnKey { algorithm },
+        "mTLS client"
+    );
 }
 
 #[test]
