@@ -1,0 +1,68 @@
+# CI gates match the commands used to validate the tree on rustc 1.89.0.
+# MSRV is workspace.package.rust-version (1.89). There is no rust-toolchain.toml;
+# this workflow pins 1.89.0 explicitly so local rustup and CI stay in agreement
+# if a toolchain file is added later.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # rustc 1.89.0 is the minimum that builds the current Cargo.lock
+  # (uuid 1.29.0 requires 1.89.0).
+  MSRV: "1.89.0"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust ${{ env.MSRV }}
+        run: |
+          rustup toolchain install "${MSRV}" --profile minimal --no-self-update --component rustfmt
+          rustup default "${MSRV}"
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust ${{ env.MSRV }}
+        run: |
+          rustup toolchain install "${MSRV}" --profile minimal --no-self-update --component clippy
+          rustup default "${MSRV}"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.89.0 is the required gate and must stay equal to env.MSRV
+        # (GitHub cannot expand env in a matrix).
+        rust: ["1.89.0", "stable"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "${{ matrix.rust }}" --profile minimal --no-self-update
+          rustup default "${{ matrix.rust }}"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --locked
