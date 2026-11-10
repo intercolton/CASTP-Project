@@ -23,9 +23,11 @@
 //!   [`FrameError::FrameTooLong`].
 //! * [`DecodeLimits::max_frame`] defaults to 65535 and can only tighten
 //!   that ceiling. A larger stored value does not raise it.
-//! * [`FrameReader`] checks `Length` before it allocates or reads the
-//!   payload, so an overlong header does not reserve a multi-megabyte
-//!   buffer. An unknown version or reserved flags also poison the
+//! * [`FrameReader`] checks `Length` before it reads the payload, so an
+//!   overlong header does not reserve a multi-megabyte buffer. A legal
+//!   payload buffer grows as bytes arrive; it is not reserved to
+//!   `Length` when the header arrives. An unknown version or reserved
+//!   flags also poison the
 //!   reader without reading the payload. Partial reads stay in the
 //!   reader across cancellation. Any error poisons it; a later read
 //!   does not touch the socket, and the connection must be closed.

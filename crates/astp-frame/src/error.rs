@@ -176,9 +176,10 @@ pub enum FrameError {
     /// The payload fit the length limit, but the allocator refused the buffer.
     ///
     /// Legal frames are at most 64 KiB of payload. This is an out-of-memory
-    /// failure, not a malformed header. On [`crate::FrameReader`], failing
-    /// to reserve the payload buffer happens before that payload is read.
-    /// The reader poisons itself either way.
+    /// failure, not a malformed header. On [`crate::FrameReader`], room is
+    /// reserved as payload bytes arrive. The first reserve is before any
+    /// payload byte is read. A later reserve can fail after some of the
+    /// payload is stored. The reader poisons itself either way.
     #[error("failed to allocate a {length}-byte frame buffer")]
     Alloc {
         /// Requested buffer size in bytes.

@@ -103,7 +103,12 @@ pub(crate) fn encoded_content(frame: &Frame) -> Result<Vec<u8>, FrameError> {
     if let Some(epoch) = frame.key_epoch {
         content.push(epoch);
     }
+    let start = content.len();
     encode_body(&frame.body, &mut content)?;
+    debug_assert_eq!(
+        content.len().saturating_sub(start),
+        body_len(&frame.body).unwrap_or(usize::MAX)
+    );
     Ok(content)
 }
 
@@ -333,7 +338,11 @@ fn encode_body(body: &FrameBody, out: &mut Vec<u8>) -> Result<(), FrameError> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode;
+    use std::net::Ipv4Addr;
+
+    use super::{body_len, decode, encode_body, encoded_content, encoded_content_len};
+    use crate::config::{Config, RouteUpdate, Tlv};
+    use crate::types::{Frame, FrameBody, Ipv4Packet, Ipv6Packet};
 
     #[test]
     fn random_bytes_do_not_panic() {
@@ -348,5 +357,59 @@ mod tests {
             }
             let _ = decode(&buf);
         }
+    }
+
+    #[test]
+    fn body_len_matches_encode_body() {
+        let mut ipv4 = vec![0u8; 20];
+        ipv4[0] = 0x45;
+        ipv4[2..4].copy_from_slice(&20u16.to_be_bytes());
+        let ipv4 = Ipv4Packet::new(ipv4).unwrap();
+        let mut ipv6 = vec![0u8; 40];
+        ipv6[0] = 0x60;
+        let ipv6 = Ipv6Packet::new(ipv6).unwrap();
+        let tlvs = vec![
+            Tlv::Addr4 {
+                addr: Ipv4Addr::LOCALHOST,
+                prefix: 32,
+            },
+            Tlv::Raw {
+                ty: 0x000C,
+                value: vec![1, 2, 3],
+            },
+        ];
+        let bodies = vec![
+            FrameBody::Padding,
+            FrameBody::Ping([1, 2, 3, 4, 5, 6, 7, 8]),
+            FrameBody::Pong([8, 7, 6, 5, 4, 3, 2, 1]),
+            FrameBody::TunIpv4(ipv4),
+            FrameBody::TunIpv6(ipv6),
+            FrameBody::Config(Config {
+                cfg_id: 9,
+                tlvs: tlvs.clone(),
+            }),
+            FrameBody::ConfigAck { cfg_id: 9, code: 1 },
+            FrameBody::RouteUpdate(RouteUpdate { tlvs }),
+            FrameBody::Disconnect {
+                code: 4,
+                reason: "bye".to_owned(),
+            },
+            FrameBody::Disconnect {
+                code: 4,
+                reason: "x".repeat(100),
+            },
+            FrameBody::Window { credit: 32 },
+        ];
+        for body in &bodies {
+            let mut buf = Vec::new();
+            encode_body(body, &mut buf).unwrap();
+            assert_eq!(buf.len(), body_len(body).unwrap(), "{body:?}");
+        }
+        let frame = Frame {
+            key_epoch: Some(3),
+            body: FrameBody::Ping([0; 8]),
+        };
+        let encoded = encoded_content(&frame).unwrap();
+        assert_eq!(encoded.len(), encoded_content_len(&frame).unwrap());
     }
 }

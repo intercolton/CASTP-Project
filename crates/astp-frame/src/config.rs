@@ -156,7 +156,12 @@ pub(crate) fn decode_tlv_list(mut rest: &[u8]) -> Result<Vec<Tlv>, FrameError> {
 
 pub(crate) fn encode_tlv_list(tlvs: &[Tlv], out: &mut Vec<u8>) -> Result<(), FrameError> {
     for tlv in tlvs {
+        let start = out.len();
         encode_one(tlv, out)?;
+        debug_assert_eq!(
+            out.len().saturating_sub(start),
+            encoded_one_len(tlv).unwrap_or(usize::MAX)
+        );
     }
     Ok(())
 }
@@ -436,4 +441,76 @@ fn read_u32(value: &[u8], ty: u16) -> Result<u32, FrameError> {
             ty,
             length: value.len(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use astp_types::TLV_MTU;
+
+    use super::{encode_one, encoded_one_len, Tlv};
+
+    fn assert_same_len(tlv: &Tlv) {
+        let mut buf = Vec::new();
+        encode_one(tlv, &mut buf).unwrap();
+        assert_eq!(buf.len(), encoded_one_len(tlv).unwrap(), "{tlv:?}");
+    }
+
+    fn assert_both_err(tlv: &Tlv) {
+        let mut buf = Vec::new();
+        assert!(encode_one(tlv, &mut buf).is_err(), "{tlv:?}");
+        assert!(encoded_one_len(tlv).is_err(), "{tlv:?}");
+        assert!(buf.is_empty(), "{tlv:?}");
+    }
+
+    #[test]
+    fn encoded_one_len_matches_encode_one() {
+        let samples = [
+            Tlv::Addr4 {
+                addr: Ipv4Addr::LOCALHOST,
+                prefix: 32,
+            },
+            Tlv::Addr6 {
+                addr: Ipv6Addr::LOCALHOST,
+                prefix: 128,
+            },
+            Tlv::Mtu(1400),
+            Tlv::Dns4(Ipv4Addr::LOCALHOST),
+            Tlv::Dns6(Ipv6Addr::LOCALHOST),
+            Tlv::Route4 {
+                dest: Ipv4Addr::LOCALHOST,
+                prefix: 8,
+                include: true,
+            },
+            Tlv::Route6 {
+                dest: Ipv6Addr::LOCALHOST,
+                prefix: 64,
+                include: false,
+            },
+            Tlv::Keepalive(1_000),
+            Tlv::IdleTimeout(30_000),
+            Tlv::SessionId([7; 16]),
+            Tlv::MaxFrame(1_500),
+            Tlv::Raw {
+                ty: 0x000C,
+                value: vec![9, 8, 7],
+            },
+        ];
+        for tlv in &samples {
+            assert_same_len(tlv);
+        }
+        assert_both_err(&Tlv::Addr4 {
+            addr: Ipv4Addr::LOCALHOST,
+            prefix: 33,
+        });
+        assert_both_err(&Tlv::Raw {
+            ty: TLV_MTU,
+            value: vec![0, 1],
+        });
+        assert_both_err(&Tlv::Raw {
+            ty: 0x00FE,
+            value: vec![0; 65_536],
+        });
+    }
 }

@@ -17,6 +17,19 @@ use crate::error::FrameError;
 use crate::header::{DecodeLimits, RawHeader};
 use crate::types::Frame;
 
+/// Finished payload buffers larger than this are dropped.
+///
+/// Smaller ones are cleared and kept, so a run of small frames does not
+/// allocate on every frame, and an idle connection does not hold the
+/// last 64 KiB payload.
+const PAYLOAD_RETAIN_MAX: usize = 8 * 1024;
+
+/// Most payload bytes one poll will take from the socket.
+///
+/// The buffer grows as those bytes arrive. `Length` is not reserved up
+/// front.
+const PAYLOAD_READ_CHUNK: usize = 4 * 1024;
+
 /// What one step of the read state machine decided.
 enum Step {
     /// The state machine moved forward without waiting on the socket.
@@ -45,7 +58,9 @@ enum Stage {
 /// The reader does not look at the next frame until the current header
 /// and, when the length cap allows it, the current payload have been
 /// taken. `Length` above the active limit is rejected from the 8-byte
-/// header, before the payload is allocated or read.
+/// header, before any payload byte is read. A legal payload is appended
+/// as each read completes. The reader does not reserve `Length` bytes
+/// when the header arrives.
 ///
 /// # Cancel safety
 ///
@@ -102,21 +117,25 @@ enum Stage {
 /// * [`FrameError::Io`] or [`FrameError::Incomplete`] while the header
 ///   or the payload is still short: not aligned. Bytes already stored
 ///   are dropped with the poison. They are not reused as a new header.
-/// * [`FrameError::Alloc`] while reserving the payload buffer happens
-///   before that payload is read. Not aligned. An allocation failure
-///   while copying an already-read frame into the decode buffer happens
-///   after the cursor has passed that frame. Aligned, then poisoned.
+/// * [`FrameError::Alloc`] while reserving room for the next payload
+///   bytes: not aligned. The first reserve happens before any payload
+///   byte is read. A later reserve can fail after some payload bytes
+///   are already stored. The reader is poisoned either way.
 /// * A body, padding, type, or TLV error after all `8 + Length` bytes
 ///   have been read: the cursor is aligned, and the reader is still
 ///   poisoned. The following frame is not parsed.
 ///
 /// # Buffer
 ///
-/// The payload allocation is released when a frame finishes, on success
-/// or on poison, so an idle connection does not keep the last payload
-/// (up to 64 KiB). Dropping [`Self::read_frame`] at `Pending` does not
-/// release a partial payload: those bytes still belong to the current
-/// frame.
+/// The 8-byte header and the payload bytes that have arrived live in
+/// one buffer. [`decode_with`](crate::decode_with) reads that buffer.
+/// There is no second copy of the frame.
+///
+/// When a frame finishes, a buffer whose capacity is above 8 KiB is
+/// dropped. A smaller buffer is cleared and kept for the next frame.
+/// The same rule runs on poison, so a failed large frame does not stay
+/// allocated. Dropping [`Self::read_frame`] at `Pending` does not free
+/// a partial payload: those bytes still belong to the current frame.
 ///
 /// One-shot [`crate::decode`] checks version, then flags, then length.
 /// That buffer is already in memory, so the order cannot desynchronize
@@ -136,8 +155,14 @@ pub struct FrameReader<R> {
     stage: Stage,
     header: [u8; FRAME_HEADER_LEN],
     header_filled: usize,
+    /// Header bytes followed by the payload bytes received so far,
+    /// once a payload has been accepted. Empty between frames, aside
+    /// from any retained capacity.
     payload: Vec<u8>,
+    /// Payload bytes received. Does not count the header prefix.
     payload_filled: usize,
+    /// Declared `Length` for the payload in progress.
+    payload_expected: usize,
 }
 
 impl<R> FrameReader<R> {
@@ -163,6 +188,7 @@ impl<R> FrameReader<R> {
             header_filled: 0,
             payload: Vec::new(),
             payload_filled: 0,
+            payload_expected: 0,
         }
     }
 
@@ -192,8 +218,18 @@ impl<R> FrameReader<R> {
         self.stage = Stage::Poisoned;
         self.header = [0; FRAME_HEADER_LEN];
         self.header_filled = 0;
-        self.payload = Vec::new();
+        self.retain_payload_buf();
+    }
+
+    /// Drop a large payload buffer. Keep a small one for the next frame.
+    fn retain_payload_buf(&mut self) {
         self.payload_filled = 0;
+        self.payload_expected = 0;
+        if self.payload.capacity() > PAYLOAD_RETAIN_MAX {
+            self.payload = Vec::new();
+        } else {
+            self.payload.clear();
+        }
     }
 
     fn fail(&mut self, err: FrameError) -> Step {
@@ -232,10 +268,16 @@ impl<R> FrameReader<R> {
     fn start_payload(&mut self, length: usize) -> Step {
         self.payload.clear();
         self.payload_filled = 0;
-        if self.payload.try_reserve_exact(length).is_err() {
-            return self.fail(FrameError::Alloc { length });
+        self.payload_expected = length;
+        // Reserve the header plus at most one read chunk, not `Length`.
+        let hint = FRAME_HEADER_LEN.saturating_add(length.min(PAYLOAD_READ_CHUNK));
+        if self.payload.capacity() < hint {
+            let need = hint.saturating_sub(self.payload.len());
+            if self.payload.try_reserve_exact(need).is_err() {
+                return self.fail(FrameError::Alloc { length: hint });
+            }
         }
-        self.payload.resize(length, 0);
+        self.payload.extend_from_slice(&self.header);
         self.stage = Stage::Payload;
         Step::Continue
     }
@@ -259,37 +301,17 @@ impl<R> FrameReader<R> {
         }
     }
 
-    fn take_payload_bytes(&mut self, n: usize) -> Step {
-        if n == 0 {
-            return self.fail(FrameError::Incomplete);
-        }
-        self.payload_filled = self.payload_filled.saturating_add(n);
-        if self.payload_filled > self.payload.len() {
-            return self.fail(FrameError::Incomplete);
-        }
-        if self.payload_filled == self.payload.len() {
-            self.finish_payload()
-        } else {
-            Step::Continue
-        }
-    }
-
     fn finish_payload(&mut self) -> Step {
-        let total = FRAME_HEADER_LEN.saturating_add(self.payload.len());
-        let mut buf = Vec::new();
-        if buf.try_reserve_exact(total).is_err() {
-            return self.fail(FrameError::Alloc { length: total });
-        }
-        buf.extend_from_slice(&self.header);
-        buf.extend_from_slice(&self.payload);
-        // The frame bytes are in `buf`. Replace the payload vec, rather
-        // than `clear`, so the capacity is released too. `clear` would
-        // leave an idle connection holding the last frame (up to 64 KiB).
-        self.payload = Vec::new();
-        self.payload_filled = 0;
+        debug_assert_eq!(
+            self.payload.len(),
+            FRAME_HEADER_LEN.saturating_add(self.payload_expected)
+        );
+        // Decode the one buffer. Do not copy it into a second vec.
+        let decoded = decode_with(&self.payload, self.limits);
         self.header_filled = 0;
-        match decode_with(&buf, self.limits) {
+        match decoded {
             Ok(frame) => {
+                self.retain_payload_buf();
                 self.stage = Stage::Ready;
                 Step::Done(Ok(Some(frame)))
             }
@@ -379,14 +401,49 @@ where
     }
 
     fn poll_payload(&mut self, cx: &mut Context<'_>) -> Step {
-        if self.payload_filled >= self.payload.len() {
+        if self.payload_filled >= self.payload_expected {
             return self.finish_payload();
         }
-        let filled = self.payload_filled;
-        match poll_read_some(&mut self.reader, cx, &mut self.payload[filled..]) {
-            Poll::Pending => Step::Wait,
-            Poll::Ready(Err(err)) => self.fail(err),
-            Poll::Ready(Ok(n)) => self.take_payload_bytes(n),
+        let remaining = self.payload_expected.saturating_sub(self.payload_filled);
+        let want = remaining.min(PAYLOAD_READ_CHUNK);
+        let start = self.payload.len();
+        if self.payload.capacity().saturating_sub(start) < want
+            && self.payload.try_reserve(want).is_err()
+        {
+            return self.fail(FrameError::Alloc { length: want });
+        }
+        let Some(end) = start.checked_add(want) else {
+            return self.fail(FrameError::Alloc { length: want });
+        };
+        // `try_reserve` already made room, so this resize does not allocate.
+        self.payload.resize(end, 0);
+        match poll_read_some(&mut self.reader, cx, &mut self.payload[start..]) {
+            Poll::Pending => {
+                // This poll kept no byte. Drop the spare tail.
+                self.payload.truncate(start);
+                Step::Wait
+            }
+            Poll::Ready(Err(err)) => {
+                self.payload.truncate(start);
+                self.fail(err)
+            }
+            Poll::Ready(Ok(0)) => {
+                self.payload.truncate(start);
+                self.fail(FrameError::Incomplete)
+            }
+            Poll::Ready(Ok(n)) => {
+                let Some(kept) = start.checked_add(n) else {
+                    self.payload.truncate(start);
+                    return self.fail(FrameError::Incomplete);
+                };
+                self.payload.truncate(kept);
+                self.payload_filled = self.payload_filled.saturating_add(n);
+                if self.payload_filled >= self.payload_expected {
+                    self.finish_payload()
+                } else {
+                    Step::Continue
+                }
+            }
         }
     }
 }
@@ -399,7 +456,9 @@ impl<R> fmt::Debug for FrameReader<R> {
             .field("stage", &self.stage)
             .field("header_filled", &self.header_filled)
             .field("payload_filled", &self.payload_filled)
+            .field("payload_expected", &self.payload_expected)
             .field("payload_len", &self.payload.len())
+            .field("payload_capacity", &self.payload.capacity())
             .finish_non_exhaustive()
     }
 }
@@ -426,7 +485,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::FrameReader;
+    use super::{FrameReader, PAYLOAD_RETAIN_MAX};
     use crate::{encode, Frame, FrameBody};
 
     #[tokio::test]
@@ -444,15 +503,20 @@ mod tests {
         };
         let mut bytes = encode(&big, None).unwrap();
         bytes.extend(encode(&small, None).unwrap());
+        bytes.extend(encode(&small, None).unwrap());
         let mut frames = FrameReader::new(std::io::Cursor::new(bytes));
         assert_eq!(frames.read_frame().await.unwrap().unwrap(), big);
         assert_eq!(
             frames.payload.capacity(),
             0,
-            "an idle reader must not keep the previous payload allocation"
+            "an idle reader must not keep a buffer above {PAYLOAD_RETAIN_MAX} bytes"
         );
         assert_eq!(frames.read_frame().await.unwrap().unwrap(), small);
-        assert_eq!(frames.payload.capacity(), 0);
+        let kept = frames.payload.capacity();
+        assert!(kept > 0, "a small frame should keep its buffer");
+        assert!(kept <= PAYLOAD_RETAIN_MAX);
+        assert_eq!(frames.read_frame().await.unwrap().unwrap(), small);
+        assert_eq!(frames.payload.capacity(), kept);
         assert!(frames.read_frame().await.unwrap().is_none());
         assert!(!frames.is_poisoned());
     }
