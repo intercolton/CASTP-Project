@@ -98,7 +98,7 @@ pub enum AlpnMode {
     Tcp,
 }
 
-/// Inputs for [`client_config`].
+/// Inputs for [`client_tls`].
 ///
 /// [`ClientOptions::server_name`] is the name the handshake must verify.
 /// This crate has no connector that skips that check.
@@ -241,14 +241,75 @@ pub fn server_config(options: ServerOptions) -> Result<Arc<rustls::ServerConfig>
     Ok(Arc::new(config))
 }
 
+/// TLS client material a transport is allowed to dial with.
+///
+/// The server name is chosen when this value is built and cannot be
+/// replaced. Fields are private: a caller cannot swap in another name
+/// or reach [`rustls::ClientConfig::dangerous`] through a setter.
+/// [`ClientTls::config`] is shared and not mutable.
+///
+/// ```compile_fail
+/// fn overwrite_sni(tls: &mut astp_crypto::ClientTls) {
+///     tls.server_name = tls.server_name().clone();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct ClientTls {
+    config: Arc<rustls::ClientConfig>,
+    server_name: ServerName<'static>,
+}
+
+impl std::fmt::Debug for ClientTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientTls")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientTls {
+    /// Shared client config. The `Arc` does not grant `&mut` access.
+    #[must_use]
+    pub fn config(&self) -> &Arc<rustls::ClientConfig> {
+        &self.config
+    }
+
+    /// Name rustls must verify. This is the only name the transport may use.
+    #[must_use]
+    pub fn server_name(&self) -> &ServerName<'static> {
+        &self.server_name
+    }
+}
+
+/// Build TLS 1.3 client material, including the name the connector must verify.
+///
+/// The IP-literal rule is applied here. Early data is disabled. There is
+/// no option to skip certificate checks. An mTLS client key, when set,
+/// must be Ed25519 or ECDSA P-256. Peer chains are verified with the ring
+/// provider's default algorithms.
+pub fn client_tls(options: ClientOptions) -> Result<ClientTls, CryptoError> {
+    let server_name = options.server_name()?;
+    let config = client_config(options)?;
+    Ok(ClientTls {
+        config,
+        server_name,
+    })
+}
+
 /// Build a TLS 1.3 client config.
 ///
+/// Prefer [`client_tls`]: the name is not stored on [`rustls::ClientConfig`],
+/// so a transport that only receives the config can be given a different
+/// name. This function remains for tests inside this crate.
+///
 /// The server name is checked while the config is built, including the
-/// IP-literal rule. Pass [`ClientOptions::server_name`] to the connector.
-/// Early data is disabled. There is no option to skip certificate checks.
-/// An mTLS client key, when set, must be Ed25519 or ECDSA P-256. Peer
-/// chains are verified with the ring provider's default algorithms.
-pub fn client_config(options: ClientOptions) -> Result<Arc<rustls::ClientConfig>, CryptoError> {
+/// IP-literal rule. Early data is disabled. There is no option to skip
+/// certificate checks. An mTLS client key, when set, must be Ed25519 or
+/// ECDSA P-256. Peer chains are verified with the ring provider's default
+/// algorithms.
+pub(crate) fn client_config(
+    options: ClientOptions,
+) -> Result<Arc<rustls::ClientConfig>, CryptoError> {
     // The name is not stored on ClientConfig. Rejecting it here means an
     // IP dial without tls_server_name never produces a usable config.
     let _name = options.server_name()?;
