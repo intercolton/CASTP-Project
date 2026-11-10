@@ -119,6 +119,7 @@ name = "astp-crypto"
 version = "0.1.0"
 dependencies = [
  "astp-types",
+ "quinn",
  "rcgen",
  "ring",
  "rustls",
@@ -157,6 +158,22 @@ version = "0.1.0"
 [[package]]
 name = "astp-transport"
 version = "0.1.0"
+dependencies = [
+ "astp-crypto",
+ "astp-frame",
+ "astp-types",
+ "bytes",
+ "h3",
+ "h3-datagram",
+ "h3-quinn",
+ "http",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "astp-tun"
@@ -531,6 +548,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3-datagram"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f"
+dependencies = [
+ "bytes",
+ "h3",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "h3-quinn"
 version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,6 +567,7 @@ dependencies = [
  "bytes",
  "futures",
  "h3",
+ "h3-datagram",
  "quinn",
  "tokio",
  "tokio-util",

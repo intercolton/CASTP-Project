@@ -13,3 +13,18 @@ upstream — в LICENSES/anet-LICENSE.md.
 что в Cargo.lock стоят uuid 1.29.0 (rust-version 1.89.0), time 0.3.55
 (rust-version 1.88.0) и rcgen 0.14.10 (rust-version 1.88). Понизить эти версии
 в lockfile технически можно; проект решил этого не делать.
+
+## Cargo.lock, задача 4 (QUIC + HTTP/3)
+
+Новый пакет, остальные версии не сдвинуты:
+
+- `h3-datagram` 0.0.2 (crates.io, checksum
+  `9d2c9f77921668673721ae40f17c729fc48b9e38a663858097cea547484fdf0f`),
+  лицензия MIT. Зависит от уже стоявших в lock `bytes`, `h3` 0.0.8 и
+  `pin-project-lite`. Форка и `[patch]` нет.
+- `h3-quinn` 0.0.10 получил зависимость на `h3-datagram` из-за feature
+  `datagram` (версия крейта та же).
+- `astp-crypto` в lock указывает `quinn` как optional-зависимость feature
+  `quinn`. Версия quinn в lock не менялась (0.11.12).
+- `h3` оставлен 0.0.8, `h3-quinn` — 0.0.10. В workspace они записаны как
+  `=0.0.8` и `=0.0.10`, рядом с `h3-datagram` `=0.0.2`.

@@ -1,8 +1,9 @@
 //! ASTP-M TLS 1.3 configuration and the channel-bound authenticator.
 //!
 //! This crate does not open sockets, speak HTTP, or define a production
-//! credential format. QUIC and TCP listeners are later tasks. The network
-//! probe is a different set of crates and is not used here.
+//! credential format. With the `quinn` feature it can read the ASTP-M
+//! exporter from a `quinn::Connection`. The network probe is a different
+//! set of crates and is not used here.
 //!
 //! # Invariants
 //!

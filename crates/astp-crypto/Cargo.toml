@@ -11,6 +11,8 @@ default = []
 # Reference HMAC authenticator for tests of later tasks.
 # Not a default feature and not a production credential format.
 test-util = ["dep:ring", "dep:subtle"]
+# `impl TlsSession for quinn::Connection`. Off unless a transport crate asks.
+quinn = ["dep:quinn"]
 
 [dependencies]
 astp-types.workspace = true
@@ -20,6 +22,7 @@ rustls-pki-types.workspace = true
 webpki-roots.workspace = true
 ring = { version = "0.17.14", optional = true }
 subtle = { version = "2.6.1", optional = true }
+quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen.workspace = true

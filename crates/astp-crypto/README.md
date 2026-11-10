@@ -11,7 +11,7 @@
 - ALPN сервера: `h3`, затем `h2` (константы `astp-types`). Клиент: `h3`, `h2` для QUIC и `h2` для TCP. `astp-m/1` по умолчанию не предлагается.
 - mTLS выключен, пока явно не задан `ClientAuth::Required`.
 - Свои ключи — только Ed25519 или ECDSA P-256. Это ключ сертификата сервера и ключ mTLS-клиента. RSA, P-384 и любой другой свой ключ отвергаются при сборке конфига (`CryptoError::UnsupportedOwnKey`). Проверка чужих цепочек не сужается: публичный CA, в том числе промежуточные Let's Encrypt на P-384 или RSA из `webpki-roots`, по-прежнему может пройти обычную проверку rustls.
-- Привязка к каналу — TLS exporter: метка `EXPORTER-ASTP-M auth v1` (`CHANNEL_BINDING_LABEL`), длина 32 (`CHANNEL_BINDING_LEN`), контекст пустой (`None`).
+- Привязка к каналу — TLS exporter: метка `EXPORTER-ASTP-M auth v1` (`CHANNEL_BINDING_LABEL`), длина 32 (`CHANNEL_BINDING_LEN`), контекст пустой (`None`). Feature `quinn` (выключена по умолчанию) реализует тот же экспорт для `quinn::Connection`: пустой контекст передаётся как `&[]`, rustls хеширует его так же, как `None`. Вторая копия метки не заводится.
 
 ## Тестовый аутентификатор
 

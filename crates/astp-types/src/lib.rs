@@ -131,13 +131,20 @@ pub const ALPN_H2: &[u8] = b"h2";
 /// Not the public default ALPN.
 pub const ALPN_ASTP_M: &[u8] = b"astp-m/1";
 
+/// Largest TUN payload, in bytes, that task 4 tries to carry as one HTTP datagram.
+///
+/// This is not QUIC's `max_datagram_size`. The transport records that value
+/// on a live connection. 1200 leaves room for an 8-byte ASTP-M header and a
+/// one-byte quarter-stream id inside a loopback packet of MTU 1500.
+pub const MAX_DATAGRAM_PAYLOAD: usize = 1200;
+
 #[cfg(test)]
 mod tests {
     use super::{
         ALPN_ASTP_M, ALPN_H2, ALPN_H3, DEFAULT_MAX_PAD, DEFAULT_MIN_WIRE_SIZE,
         DEFAULT_PADDING_STEP, FLAG_KEY_EPOCH, FLAG_PAD, FLAG_RESERVED_MASK, FRAME_HEADER_LEN,
-        FRAME_RESERVED_SPLIT_FIRST, FRAME_RESERVED_SPLIT_LAST, FRAME_VERSION, MAX_FRAME_LENGTH,
-        PROTOCOL_NAME, TLV_RESERVED_SPLIT_C, TLV_RESERVED_SPLIT_D,
+        FRAME_RESERVED_SPLIT_FIRST, FRAME_RESERVED_SPLIT_LAST, FRAME_VERSION, MAX_DATAGRAM_PAYLOAD,
+        MAX_FRAME_LENGTH, PROTOCOL_NAME, TLV_RESERVED_SPLIT_C, TLV_RESERVED_SPLIT_D,
     };
 
     #[test]
@@ -166,5 +173,6 @@ mod tests {
         assert_eq!(DEFAULT_PADDING_STEP, 64);
         assert_eq!(DEFAULT_MIN_WIRE_SIZE, 64);
         assert_eq!(DEFAULT_MAX_PAD, 255);
+        assert_eq!(MAX_DATAGRAM_PAYLOAD, 1200);
     }
 }
