@@ -19,12 +19,14 @@ for t in ip openssl ping; do command -v "$t" >/dev/null || { echo "missing $t" >
 WORK=$(mktemp -d)
 SRV=astp-smoke-srv
 CLI=astp-smoke-cli
+NET=astp-smoke-net
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
     ip netns del "$SRV" 2>/dev/null || true
     ip netns del "$CLI" 2>/dev/null || true
+    ip netns del "$NET" 2>/dev/null || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -53,6 +55,19 @@ ip -n "$CLI" addr add 192.0.2.2/24 dev veth-cli
 for ns in "$SRV" "$CLI"; do ip -n "$ns" link set lo up; done
 ip -n "$SRV" link set veth-srv up
 ip -n "$CLI" link set veth-cli up
+# A host "on the internet" behind the server. It routes the tunnel subnet
+# back to the server, so forwarding is tested without NAT.
+ip netns add "$NET"
+ip link add veth-out type veth peer name veth-net
+ip link set veth-out netns "$SRV"
+ip link set veth-net netns "$NET"
+ip -n "$SRV" addr add 198.51.100.1/24 dev veth-out
+ip -n "$NET" addr add 198.51.100.2/24 dev veth-net
+ip -n "$NET" link set lo up
+ip -n "$SRV" link set veth-out up
+ip -n "$NET" link set veth-net up
+ip -n "$NET" route add 10.77.0.0/24 via 198.51.100.1
+ip netns exec "$SRV" sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
 
 cat > "$WORK/server.toml" <<TOML
 [server]
@@ -105,8 +120,9 @@ TOML
     # Default route through the tunnel, server reachable around it.
     ip -n "$CLI" route | grep -q "0.0.0.0/1 dev astp0" || { echo "$t: no tunnel route" >&2; status=1; }
     if ip netns exec "$CLI" ping -c 3 -W 2 10.77.0.1 >"$WORK/ping-$t.log" 2>&1 \
-        && ip netns exec "$SRV" ping -c 3 -W 2 10.77.0.2 >>"$WORK/ping-$t.log" 2>&1; then
-        echo "$t: OK (client <-> server through the tunnel)"
+        && ip netns exec "$SRV" ping -c 3 -W 2 10.77.0.2 >>"$WORK/ping-$t.log" 2>&1 \
+        && ip netns exec "$CLI" ping -c 3 -W 2 198.51.100.2 >>"$WORK/ping-$t.log" 2>&1; then
+        echo "$t: OK (client <-> server and client -> host behind the server, through the tunnel)"
     else
         echo "$t: FAILED" >&2
         cat "$WORK/ping-$t.log" "$WORK/client-$t.log" "$WORK/server.log" >&2
