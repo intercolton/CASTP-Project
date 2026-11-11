@@ -130,6 +130,14 @@ pub struct DeliverySection {
     /// Name of the environment variable holding the bearer token.
     #[serde(default = "default_token_env")]
     pub token_env: String,
+    /// PEM file with the trust anchors for the delivery endpoint, when it
+    /// uses a private CA. Unset: the Mozilla root set.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Name to verify the endpoint's certificate against when the URL host
+    /// is an IP literal or differs from the certificate name.
+    #[serde(default)]
+    pub tls_server_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -614,6 +622,40 @@ listen = "127.0.0.1:9443"
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         ClientConfig::load(&root.join("configs/client.example.toml")).unwrap();
         ServerConfig::load(&root.join("configs/server.example.toml")).unwrap();
+    }
+
+    /// Every commented-out `key = value` line and `[section]` header in the
+    /// client example is a real option: uncommented, the file must still
+    /// parse and validate.
+    #[test]
+    fn client_example_with_commented_options_enabled() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("configs/client.example.toml")).unwrap();
+        let mut enabled = 0;
+        let uncommented: String = text
+            .lines()
+            .map(|l| {
+                let Some(rest) = l.strip_prefix("# ") else {
+                    return l.to_owned();
+                };
+                let is_header = rest.starts_with('[') && rest.ends_with(']');
+                let is_key = rest
+                    .split_once(" = ")
+                    .is_some_and(|(k, _)| k.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+                if is_header || is_key {
+                    enabled += 1;
+                    rest.to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(enabled >= 5, "expected commented options, found {enabled}");
+        let c = ClientConfig::from_toml(&uncommented).unwrap();
+        let d = c.delivery.expect("[delivery] enabled");
+        assert_eq!(d.tls_server_name.as_deref(), Some("probe.example.net"));
+        assert!(d.ca_file.is_some());
     }
 
     #[test]
