@@ -27,6 +27,10 @@ pub const ECHO_PATH: &str = "/echo";
 pub const DOWNLOAD_PATH: &str = "/download";
 pub const SESSION_PATH: &str = "/session";
 const TEST_ID_HEADER: &str = "x-astp-test-id";
+/// Answer bodies shared by the TCP and QUIC listeners, so the logged
+/// `bytes_sent` is the real length in both.
+pub const PROBE_BODY: &str = "ok astp\n";
+pub const ECHO_BODY: &str = "echo\n";
 
 type RespBody = UnsyncBoxBody<Bytes, Infallible>;
 
@@ -234,12 +238,12 @@ impl Service {
                 } else {
                     TestType::HttpsGet
                 };
-                self.log_now(self.event(req, tt), 9);
-                text(StatusCode::OK, "ok astp\n")
+                self.log_now(self.event(req, tt), PROBE_BODY.len() as u64);
+                text(StatusCode::OK, PROBE_BODY)
             }
             ECHO_PATH => {
-                self.log_now(self.event(req, TestType::Echo), 5);
-                text(StatusCode::OK, "echo\n")
+                self.log_now(self.event(req, TestType::Echo), ECHO_BODY.len() as u64);
+                text(StatusCode::OK, ECHO_BODY)
             }
             DOWNLOAD_PATH => {
                 let want: u64 = query_param(q, "bytes")

@@ -17,13 +17,27 @@ use tokio::time::Interval;
 const CHUNK: usize = 16 * 1024;
 static FILLER: [u8; CHUNK] = [b'.'; CHUNK];
 
+/// Why a body stopped producing data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// Download: every promised byte went out.
+    Complete,
+    /// The time limit ran out first. Normal for a session, a failure for a
+    /// download (the client got less than `Content-Length`).
+    Deadline,
+    /// Session: the byte cap ran out before the requested length.
+    ByteCap,
+}
+
 pub struct GenBody {
     remaining: u64,
+    total: u64,
     chunk: usize,
+    /// `Some` for a session (heartbeats), `None` for a download.
     interval: Option<Interval>,
     deadline: Instant,
     sent: u64,
-    completed: bool,
+    ended: Option<Ended>,
     log: Option<(EventTx, ProbeEvent, Instant)>,
 }
 
@@ -32,11 +46,12 @@ impl GenBody {
     pub fn download(bytes: u64, deadline: Instant, log: (EventTx, ProbeEvent)) -> Self {
         GenBody {
             remaining: bytes,
+            total: bytes,
             chunk: CHUNK,
             interval: None,
             deadline,
             sent: 0,
-            completed: false,
+            ended: None,
             log: Some((log.0, log.1, Instant::now())),
         }
     }
@@ -53,12 +68,28 @@ impl GenBody {
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         GenBody {
             remaining: max_bytes,
+            total: max_bytes,
             chunk: size.clamp(1, CHUNK),
             interval: Some(iv),
             deadline,
             sent: 0,
-            completed: false,
+            ended: None,
             log: Some((log.0, log.1, Instant::now())),
+        }
+    }
+
+    fn is_session(&self) -> bool {
+        self.interval.is_some()
+    }
+
+    /// Whether the body is finished, and why.
+    fn check_end(&self) -> Option<Ended> {
+        let late = Instant::now() >= self.deadline;
+        match (self.is_session(), self.remaining == 0, late) {
+            (false, true, _) => Some(Ended::Complete),
+            (true, _, true) | (false, false, true) => Some(Ended::Deadline),
+            (true, true, false) => Some(Ended::ByteCap),
+            (_, false, false) => None,
         }
     }
 }
@@ -71,7 +102,7 @@ impl Body for GenBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        if self.completed {
+        if self.ended.is_some() {
             return Poll::Ready(None);
         }
         if let Some(iv) = self.interval.as_mut() {
@@ -79,8 +110,8 @@ impl Body for GenBody {
                 return Poll::Pending;
             }
         }
-        if self.remaining == 0 || Instant::now() >= self.deadline {
-            self.completed = true;
+        if let Some(end) = self.check_end() {
+            self.ended = Some(end);
             return Poll::Ready(None);
         }
         let n = (self.chunk as u64).min(self.remaining) as usize;
@@ -90,14 +121,14 @@ impl Body for GenBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.completed
+        self.ended.is_some()
     }
 
     fn size_hint(&self) -> SizeHint {
-        if self.interval.is_none() {
-            SizeHint::with_exact(self.remaining)
-        } else {
+        if self.is_session() {
             SizeHint::default()
+        } else {
+            SizeHint::with_exact(self.remaining)
         }
     }
 }
@@ -109,25 +140,118 @@ impl Drop for GenBody {
         };
         ev.duration_ms = start.elapsed().as_millis() as u64;
         ev.bytes_sent = self.sent;
-        ev.phase = Some(if self.completed {
-            Phase::Completed
-        } else if self.sent > 0 {
-            Phase::AppDataSent
-        } else {
-            Phase::HandshakeDone
+        ev.phase = Some(match self.ended {
+            Some(Ended::Complete | Ended::ByteCap) => Phase::Completed,
+            Some(Ended::Deadline) if self.is_session() => Phase::Completed,
+            _ if self.sent > 0 => Phase::AppDataSent,
+            _ => Phase::HandshakeDone,
         });
-        let ev = if self.completed {
-            ev.succeed()
-        } else {
-            ev.fail(
+        let ev = match self.ended {
+            Some(Ended::Complete) => ev.succeed(),
+            Some(Ended::Deadline) if self.is_session() => ev.succeed(),
+            Some(Ended::Deadline) => {
+                let secs = start.elapsed().as_secs();
+                ev.fail(
+                    ErrorCode::ApplicationTimeout,
+                    format!(
+                        "download cut at the {secs} s session limit: {} of {} B sent",
+                        self.sent, self.total
+                    ),
+                )
+            }
+            Some(Ended::ByteCap) => {
+                ev.detail = Some(format!(
+                    "ended early: max_session_bytes ({} B) reached",
+                    self.total
+                ));
+                ev.succeed()
+            }
+            None => ev.fail(
                 ErrorCode::RemoteClosed,
                 format!("client went away after {} B", self.sent),
-            )
+            ),
         };
         // Drop cannot await; if the log queue is full the event is lost and
         // that is reported instead of blocking the runtime.
         if tx.try_send(ev).is_err() {
             tracing::warn!("event queue full, dropped a session event");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use probe_common::{TestType, Transport};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn log() -> ((EventTx, ProbeEvent), mpsc::Receiver<ProbeEvent>) {
+        let (tx, rx) = mpsc::channel(4);
+        let ev = ProbeEvent::new("t", "s", "server", "s", TestType::Download, Transport::Tcp);
+        ((tx, ev), rx)
+    }
+
+    async fn drain(mut b: GenBody) -> u64 {
+        let mut n = 0;
+        while let Some(f) = b.frame().await {
+            n += f.unwrap().into_data().map(|d| d.len() as u64).unwrap_or(0);
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn full_download_is_a_success() {
+        let (l, mut rx) = log();
+        let b = GenBody::download(40_000, Instant::now() + Duration::from_secs(5), l);
+        assert_eq!(drain(b).await, 40_000);
+        let ev = rx.recv().await.unwrap();
+        assert!(ev.success, "{ev:?}");
+        assert_eq!(ev.phase, Some(Phase::Completed));
+        assert_eq!(ev.bytes_sent, 40_000);
+    }
+
+    #[tokio::test]
+    async fn download_cut_by_the_deadline_is_a_failure() {
+        let (l, mut rx) = log();
+        let b = GenBody::download(40_000, Instant::now(), l);
+        assert_eq!(drain(b).await, 0);
+        let ev = rx.recv().await.unwrap();
+        assert!(!ev.success, "{ev:?}");
+        assert_eq!(ev.error_code, Some(ErrorCode::ApplicationTimeout));
+        assert!(
+            ev.detail.as_deref().unwrap().contains("0 of 40000 B"),
+            "{ev:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_deadline_is_normal_and_byte_cap_is_noted() {
+        let (l, mut rx) = log();
+        let b = GenBody::session(
+            10,
+            Duration::from_millis(1),
+            Instant::now() + Duration::from_millis(30),
+            1_000_000,
+            l,
+        );
+        drain(b).await;
+        let ev = rx.recv().await.unwrap();
+        assert!(ev.success, "{ev:?}");
+        assert_eq!(ev.detail, None);
+
+        let (l, mut rx) = log();
+        let b = GenBody::session(
+            10,
+            Duration::from_millis(1),
+            Instant::now() + Duration::from_secs(60),
+            25,
+            l,
+        );
+        assert_eq!(drain(b).await, 25);
+        let ev = rx.recv().await.unwrap();
+        assert!(ev.success, "{ev:?}");
+        assert!(ev.detail.as_deref().unwrap().contains("max_session_bytes"));
     }
 }

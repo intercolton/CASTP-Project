@@ -2,7 +2,7 @@
 //! `quic_accept` event, including those whose handshake never completes;
 //! `/probe` and `/echo` over HTTP/3 are logged with the client's test id.
 
-use crate::handler::{request_event, ECHO_PATH, PROBE_PATH};
+use crate::handler::{request_event, ECHO_BODY, ECHO_PATH, PROBE_BODY, PROBE_PATH};
 use crate::{tls, Shared};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -171,11 +171,13 @@ async fn serve_h3(
                     let started = Instant::now();
                     let (status, body, tt): (_, &'static [u8], _) =
                         match (req.method(), req.uri().path()) {
-                            (&http::Method::GET, PROBE_PATH) => {
-                                (StatusCode::OK, b"ok astp\n", Some(TestType::H3Request))
-                            }
+                            (&http::Method::GET, PROBE_PATH) => (
+                                StatusCode::OK,
+                                PROBE_BODY.as_bytes(),
+                                Some(TestType::H3Request),
+                            ),
                             (&http::Method::GET, ECHO_PATH) => {
-                                (StatusCode::OK, b"echo\n", Some(TestType::Echo))
+                                (StatusCode::OK, ECHO_BODY.as_bytes(), Some(TestType::Echo))
                             }
                             (&http::Method::GET, _) => {
                                 (StatusCode::NOT_FOUND, b"not found\n", None)
