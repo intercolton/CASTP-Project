@@ -194,6 +194,29 @@ impl Drop for GenBody {
     }
 }
 
+/// A response body fed line by line from a task (upload acknowledgements).
+pub struct ChannelBody {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+}
+
+impl ChannelBody {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
+        ChannelBody { rx }
+    }
+}
+
+impl Body for ChannelBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        self.rx.poll_recv(cx).map(|b| b.map(|b| Ok(Frame::data(b))))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,6 +14,7 @@ use tokio::net::TcpStream;
 /// Path on the probe server that answers short requests and logs the test id.
 pub const PROBE_PATH: &str = "/probe";
 pub const TEST_ID_HEADER: &str = "x-astp-test-id";
+pub const PAIR_ID_HEADER: &str = "x-astp-pair-id";
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -21,6 +22,9 @@ pub struct Ctx {
     pub network_id: String,
     pub iface: Option<String>,
     pub limits: LimitsSection,
+    /// Set while the two halves of a paired cascade probe run: written into
+    /// both events and sent to both servers.
+    pub pair_id: Option<String>,
 }
 
 impl Ctx {
@@ -100,6 +104,7 @@ impl Attempt {
             transport,
         );
         ev.interface = ctx.iface.clone();
+        ev.pair_id = ctx.pair_id.clone();
         ev.phase = Some(Phase::None);
         Attempt {
             ev,

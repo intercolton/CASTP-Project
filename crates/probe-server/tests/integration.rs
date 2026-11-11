@@ -379,6 +379,7 @@ async fn control_counts_any_http_answer_as_reachable() {
         network_id: "n".into(),
         iface: None,
         limits: cfg.limits.clone(),
+        pair_id: None,
     };
     // Controls use the public root store, so the private CA is rejected:
     // that is a certificate error, not a reachable control.
@@ -402,6 +403,7 @@ fn ctx_for(cfg: &ClientConfig) -> probes::Ctx {
         network_id: cfg.client.network_id.clone(),
         iface: None,
         limits: cfg.limits.clone(),
+        pair_id: None,
     }
 }
 
@@ -765,4 +767,177 @@ async fn refusals_are_rate_limited() {
         })
         .sum();
     assert_eq!(total, 50, "{refusals:#?}");
+}
+
+// ------------------------------------------------------- cascade (split) ---
+
+#[tokio::test]
+async fn upload_session_runs_to_the_end() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let plan = SessionPlan {
+        seconds: 2,
+        interval_ms: 200,
+        size: 100,
+        stall_seconds: 2,
+    };
+    let e = stream::upload_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert!(e.success, "{e:?}");
+    assert_eq!(e.direction, Some(probe_common::Direction::Up));
+    assert_eq!(e.phase, Some(Phase::Completed));
+    assert!(e.duration_ms >= 1800, "{e:?}");
+    let d = e.detail.as_deref().unwrap();
+    // About 2 s / 200 ms heartbeats of 100 B, all acknowledged.
+    let sent: u64 = d.split(' ').next().unwrap().parse().unwrap();
+    assert!((800..=1200).contains(&sent) && sent % 100 == 0, "{d}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let s = sev
+        .iter()
+        .find(|s| s.test_id == e.test_id)
+        .expect("server logged the upload");
+    assert!(s.success, "{s:?}");
+    assert_eq!(s.direction, Some(probe_common::Direction::Up));
+    assert_eq!(s.bytes_received, sent);
+}
+
+/// Like `freezing_relay`, but the client→server direction stops after
+/// `budget` bytes: the uplink freezes while the downlink stays open.
+async fn freezing_uplink_relay(
+    upstream: std::net::SocketAddr,
+    budget: usize,
+) -> std::net::SocketAddr {
+    use tokio::io::AsyncReadExt;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (c, _) = l.accept().await.unwrap();
+        let s = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        let (mut cr, mut cw) = c.into_split();
+        let (mut sr, mut sw) = s.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+        });
+        let mut left = budget;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = match cr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let pass = n.min(left);
+            if pass > 0 {
+                sw.write_all(&buf[..pass]).await.unwrap();
+                left -= pass;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn upload_session_reports_a_freeze() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    // Enough for TLS, the HTTP/2 preface and a few heartbeats.
+    let relay = freezing_uplink_relay(server.addr, 8_000).await;
+    let cfg = client_cfg(relay.port(), &pki.path("ca.pem"), data.path());
+    let plan = SessionPlan {
+        seconds: 20,
+        interval_ms: 100,
+        size: 500,
+        stall_seconds: 2,
+    };
+    let t = std::time::Instant::now();
+    let e = stream::upload_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert_eq!(e.error_code, Some(ErrorCode::ApplicationTimeout), "{e:?}");
+    let d = e.detail.as_deref().unwrap();
+    assert!(d.starts_with("stalled: no acknowledgement for 2 s"), "{d}");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    server.shutdown().await.unwrap();
+}
+
+/// Split-path cascade: upload to A and download from B at the same time.
+/// Both client events and both servers' events carry the same pair_id.
+#[tokio::test]
+async fn paired_probe_joins_both_servers() {
+    use probe_common::config::TargetRole;
+    use probe_common::Direction;
+    let pki = Pki::new();
+    let data_a = tempfile::tempdir().unwrap();
+    let data_b = tempfile::tempdir().unwrap();
+    let a = probe_server::start(server_cfg(&pki, data_a.path(), 5))
+        .await
+        .unwrap();
+    let b = probe_server::start(server_cfg(&pki, data_b.path(), 5))
+        .await
+        .unwrap();
+    let mut cfg = client_cfg(a.addr.port(), &pki.path("ca.pem"), data_a.path());
+    let mut down = cfg.targets[0].clone();
+    cfg.targets[0].id = "up-a".into();
+    cfg.targets[0].role = TargetRole::Uplink;
+    down.id = "down-b".into();
+    down.port = b.addr.port();
+    down.role = TargetRole::Downlink;
+    cfg.targets.push(down);
+    assert_eq!(probe_client::pairs(&cfg).len(), 1);
+
+    let plan = SessionPlan {
+        seconds: 1,
+        interval_ms: 200,
+        size: 100,
+        stall_seconds: 2,
+    };
+    let mut events = Vec::new();
+    probe_client::run_long(&cfg, plan, |e| events.push(e), |_, _, _| {}).await;
+    // A: upload only. B: download only. Then the pair.
+    assert_eq!(events.len(), 4, "{events:#?}");
+    for e in &events {
+        assert!(e.success, "{e:?}");
+        e.validate().unwrap();
+    }
+    assert_eq!(
+        (events[0].target_id.as_str(), events[0].direction),
+        ("up-a", Some(Direction::Up))
+    );
+    assert_eq!(
+        (events[1].target_id.as_str(), events[1].direction),
+        ("down-b", Some(Direction::Down))
+    );
+    assert!(events[..2].iter().all(|e| e.pair_id.is_none()));
+    let pair = events[2].pair_id.clone().expect("pair id");
+    assert_eq!(events[3].pair_id.as_deref(), Some(pair.as_str()));
+    assert_eq!(events[2].direction, Some(Direction::Up));
+    assert_eq!(events[3].direction, Some(Direction::Down));
+    // Run at the same time, not one after the other.
+    let (t2, t3) = (&events[2].timestamp, &events[3].timestamp);
+    let start = |e: &ProbeEvent| {
+        probe_common::timefmt::parse_rfc3339(&e.timestamp)
+            .unwrap()
+            .unix_timestamp_nanos()
+    };
+    let gap = (start(&events[2]) - start(&events[3])).abs();
+    assert!(gap < 500_000_000, "{t2} vs {t3}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    for (dir, data) in [(Direction::Up, &data_a), (Direction::Down, &data_b)] {
+        let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+        let s = sev
+            .iter()
+            .find(|s| s.pair_id.as_deref() == Some(pair.as_str()))
+            .unwrap_or_else(|| panic!("server for {dir:?} has no paired event: {sev:#?}"));
+        assert_eq!(s.direction, Some(dir));
+    }
 }

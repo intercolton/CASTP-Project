@@ -67,6 +67,27 @@ pub enum Transport {
     Quic,
 }
 
+/// Which way the measured payload flows, seen from the client. Set on
+/// directional tests (download, long sessions); in a split-path cascade
+/// the upload and the download legs end on different servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// Client to server.
+    Up,
+    /// Server to client.
+    Down,
+}
+
+impl Direction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
@@ -135,6 +156,12 @@ pub struct ProbeEvent {
     /// to their `tcp_accept`/`quic_accept` without trusting the wall clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_conn_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
+    /// Shared by the upload and download halves of a paired probe, on the
+    /// client and on both servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
 }
 
 fn default_side() -> Side {
@@ -180,6 +207,8 @@ impl ProbeEvent {
             connect_ms: None,
             handshake_ms: None,
             since_conn_ms: None,
+            direction: None,
+            pair_id: None,
         }
     }
 
@@ -289,6 +318,8 @@ mod tests {
         e.phase = Some(Phase::TcpConnected);
         e.tls_stack = Some("rustls-0.23/ring".into());
         e.control = true;
+        e.direction = Some(Direction::Up);
+        e.pair_id = Some("p1".into());
         let s = serde_json::to_string(&e).unwrap();
         let back: ProbeEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back, e);

@@ -10,7 +10,10 @@ pub mod jsonl;
 pub mod timefmt;
 
 pub use error_code::ErrorCode;
-pub use event::{Phase, ProbeEvent, Side, TestType, Transport, READABLE_SCHEMA_VERSIONS, SCHEMA_VERSION};
+pub use event::{
+    Direction, Phase, ProbeEvent, Side, TestType, Transport, READABLE_SCHEMA_VERSIONS,
+    SCHEMA_VERSION,
+};
 
 /// `error: cause: cause…` — the top-level message alone ("connection
 /// error") rarely says what happened.

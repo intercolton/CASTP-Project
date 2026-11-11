@@ -185,6 +185,7 @@ fn build_config(a: &TestArgs) -> Result<ClientConfig> {
                 enable_quic: true,
                 enable_h3: true,
                 quic_port: a.port,
+                role: Default::default(),
             }],
             controls: vec![],
         };

@@ -168,6 +168,32 @@ pub struct TargetConfig {
     pub enable_h3: bool,
     #[serde(default = "default_quic_port")]
     pub quic_port: u16,
+    /// Which direction this node carries in a split-path cascade.
+    #[serde(default)]
+    pub role: TargetRole,
+}
+
+/// The part a target plays in a split-path cascade: the client's upload
+/// goes to an `uplink` node, its download comes from a `downlink` node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetRole {
+    Uplink,
+    Downlink,
+    /// A single server carrying both directions.
+    #[default]
+    Both,
+}
+
+impl TargetRole {
+    /// Upload tests (client to server) apply to this target.
+    pub fn up(self) -> bool {
+        matches!(self, TargetRole::Uplink | TargetRole::Both)
+    }
+    /// Download tests (server to client) apply to this target.
+    pub fn down(self) -> bool {
+        matches!(self, TargetRole::Downlink | TargetRole::Both)
+    }
 }
 
 impl TargetConfig {
@@ -288,6 +314,12 @@ impl ClientConfig {
             }
             if t.host.trim().is_empty() {
                 return bad(format!("target {}: host must not be empty", t.id));
+            }
+            if t.role != TargetRole::Both && !t.enable_tls {
+                return bad(format!(
+                    "target {}: role {:?} needs enable_tls (directional tests run over TLS + HTTP/2)",
+                    t.id, t.role
+                ));
             }
             if t.host.parse::<std::net::IpAddr>().is_ok() && t.tls_server_name.is_none() {
                 let needs_tls = t.enable_tls || t.enable_h2 || t.enable_quic || t.enable_h3;
@@ -656,6 +688,17 @@ listen = "127.0.0.1:9443"
         let d = c.delivery.expect("[delivery] enabled");
         assert_eq!(d.tls_server_name.as_deref(), Some("probe.example.net"));
         assert!(d.ca_file.is_some());
+    }
+
+    #[test]
+    fn target_role_defaults_to_both() {
+        let t = "[client]\nid=\"x\"\n[[targets]]\nid=\"a\"\nhost=\"h\"\n[[targets]]\nid=\"b\"\nhost=\"h\"\nrole=\"uplink\"\n";
+        let c = ClientConfig::from_toml(t).unwrap();
+        assert_eq!(c.targets[0].role, TargetRole::Both);
+        assert_eq!(c.targets[1].role, TargetRole::Uplink);
+        assert!(c.targets[1].role.up() && !c.targets[1].role.down());
+        let bad = format!("{t}enable_tls=false\n");
+        assert!(ClientConfig::from_toml(&bad).is_err());
     }
 
     #[test]

@@ -5,15 +5,21 @@
 //! - `GET /echo`                        tiny answer for application RTT
 //! - `GET /download?bytes=N`            N bytes, capped by the server limit
 //! - `GET /session?seconds=S&interval_ms=I&size=B` heartbeats for a long session
+//! - `POST /session?seconds=S`                upstream long session; the
+//!   response streams acknowledgements (`<bytes received>\n`) as data
+//!   arrives and ends with `done <total>\n`
+//!
+//! Any request may carry `pair_id` (query or `x-astp-pair-id`): the two
+//! halves of a paired cascade probe share it, on both servers.
 
-use crate::body::GenBody;
+use crate::body::{ChannelBody, GenBody};
 use crate::EventTx;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use probe_common::config::ServerLimitsSection;
-use probe_common::{Phase, ProbeEvent, Side, TestType, Transport};
+use probe_common::{Direction, ErrorCode, Phase, ProbeEvent, Side, TestType, Transport};
 use std::convert::Infallible;
 use std::future::{ready, Future};
 use std::net::SocketAddr;
@@ -27,6 +33,9 @@ pub const ECHO_PATH: &str = "/echo";
 pub const DOWNLOAD_PATH: &str = "/download";
 pub const SESSION_PATH: &str = "/session";
 const TEST_ID_HEADER: &str = "x-astp-test-id";
+const PAIR_ID_HEADER: &str = "x-astp-pair-id";
+/// Upload acknowledgements are sent at most this often.
+const ACK_EVERY: Duration = Duration::from_millis(200);
 /// Answer bodies shared by the TCP and QUIC listeners, so the logged
 /// `bytes_sent` is the real length in both.
 pub const PROBE_BODY: &str = "ok astp\n";
@@ -49,6 +58,35 @@ pub struct Service {
     pub conn_start: Instant,
 }
 
+/// Why a request body broke off: the peer went away (FIN or RST) or sent
+/// something malformed.
+fn abort_code(e: &hyper::Error) -> ErrorCode {
+    use std::error::Error as _;
+    let mut src = e.source();
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            let c = ErrorCode::from_stream_error(io);
+            if c != ErrorCode::Unknown {
+                return c;
+            }
+        }
+        if let Some(h2e) = s.downcast_ref::<h2::Error>() {
+            if let Some(io) = h2e.get_io() {
+                return ErrorCode::from_stream_error(io);
+            }
+            if h2e.is_reset() || h2e.is_go_away() {
+                return ErrorCode::RemoteClosed;
+            }
+        }
+        src = s.source();
+    }
+    if e.is_incomplete_message() || e.is_closed() || e.is_canceled() {
+        ErrorCode::RemoteClosed
+    } else {
+        ErrorCode::HttpProtocolError
+    }
+}
+
 /// Takes up to `want` bytes from `budget`; returns how many were granted.
 pub(crate) fn take(budget: &AtomicU64, want: u64) -> u64 {
     let mut got = 0;
@@ -67,8 +105,7 @@ impl hyper::service::Service<Request<Incoming>> for Service {
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         self.requests.fetch_add(1, Ordering::Relaxed);
         if req.method() == http::Method::POST && req.uri().path() == SESSION_PATH {
-            let this = self.clone();
-            return Box::pin(async move { Ok(this.upload_session(req).await) });
+            return Box::pin(ready(Ok(self.upload_session(req))));
         }
         Box::pin(ready(Ok(self.route(&req))))
     }
@@ -116,6 +153,13 @@ pub(crate) fn request_event<B>(
     ev.peer = Some(peer.to_string());
     ev.alpn = Some(alpn.into());
     ev.since_conn_ms = Some(conn_start.elapsed().as_millis() as u64);
+    ev.pair_id = req
+        .headers()
+        .get(PAIR_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| query_param(req.uri().query(), "pair_id"))
+        .filter(|s| !s.is_empty() && s.len() <= 64)
+        .map(str::to_owned);
     ev
 }
 
@@ -177,75 +221,98 @@ impl Service {
         }
     }
 
-    /// Upstream long session: the client sends heartbeats, the server counts
-    /// them and answers with the byte total. This is the opposite direction
-    /// of `GET /session` and is not run at the same time by the scheduler.
-    async fn upload_session(&self, req: Request<Incoming>) -> Response<RespBody> {
-        let q = req.uri().query().map(str::to_owned);
-        let seconds: u64 = query_param(q.as_deref(), "seconds")
+    /// Upstream long session: the client sends heartbeats and the server
+    /// acknowledges the running byte total on the response stream, so the
+    /// client can tell a frozen uplink from a slow one. The response starts
+    /// at once; the acknowledgements are the only data sent back.
+    fn upload_session(&self, req: Request<Incoming>) -> Response<RespBody> {
+        let seconds: u64 = query_param(req.uri().query(), "seconds")
             .and_then(|v| v.parse().ok())
             .unwrap_or(60)
             .clamp(1, self.limits.max_session_seconds);
         let mut ev = self.event(&req, TestType::LongSession);
-        ev.detail = Some("direction=up".into());
+        ev.direction = Some(Direction::Up);
+        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let this = self.clone();
+        let body = req.into_body();
+        tokio::spawn(async move { this.receive_upload(body, seconds, ev, ack_tx).await });
+        Response::builder()
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(ChannelBody::new(ack_rx).boxed_unsync())
+            .expect("valid response")
+    }
+
+    async fn receive_upload(
+        &self,
+        mut body: Incoming,
+        seconds: u64,
+        mut ev: ProbeEvent,
+        ack: tokio::sync::mpsc::Sender<Bytes>,
+    ) {
         let started = Instant::now();
         let deadline =
             Duration::from_secs(seconds.saturating_add(self.limits.idle_timeout_seconds));
         let mut received = 0u64;
-        let mut body = req.into_body();
+        let mut acked = 0u64;
+        let mut last_ack = Instant::now();
         let read = async {
             while let Some(frame) = body.frame().await {
-                let frame = frame.map_err(|e| e.to_string())?;
-                if let Some(data) = frame.data_ref() {
-                    let n = data.len() as u64;
-                    received += n;
-                    if received > self.limits.max_session_bytes {
-                        return Err("upload exceeded max_session_bytes".into());
-                    }
-                    if take(&self.budget, n) < n {
-                        return Err("upload exceeded the connection byte budget".into());
+                let frame =
+                    frame.map_err(|e| (abort_code(&e), format!("upload broken off: {e}")))?;
+                let Some(data) = frame.data_ref() else {
+                    continue;
+                };
+                let n = data.len() as u64;
+                received += n;
+                if received > self.limits.max_session_bytes || take(&self.budget, n) < n {
+                    return Err((
+                        ErrorCode::Unknown,
+                        "upload exceeded max_session_bytes".to_owned(),
+                    ));
+                }
+                if last_ack.elapsed() >= ACK_EVERY {
+                    // A client that stopped reading acks is not waited for.
+                    if ack.try_send(Bytes::from(format!("{received}\n"))).is_ok() {
+                        acked = received;
+                        last_ack = Instant::now();
                     }
                 }
             }
-            Ok::<(), String>(())
+            Ok(())
         };
         let outcome = tokio::time::timeout(deadline, read).await;
-        ev.duration_ms = started.elapsed().as_millis() as u64;
-        ev.bytes_received = received;
-        ev.phase = Some(if received > 0 {
-            Phase::AppDataReceived
-        } else {
-            Phase::HandshakeDone
-        });
-        let (status, msg, ev) = match outcome {
-            Ok(Ok(())) if received > 0 => (StatusCode::OK, format!("{received}\n"), ev.succeed()),
-            Ok(Ok(())) => (
-                StatusCode::BAD_REQUEST,
-                "empty upload\n".into(),
-                ev.fail(probe_common::ErrorCode::RemoteClosed, "empty upload"),
-            ),
-            Ok(Err(detail)) => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "limit\n".into(),
-                ev.fail(probe_common::ErrorCode::Unknown, detail),
-            ),
-            Err(_) => (
-                StatusCode::REQUEST_TIMEOUT,
-                "timeout\n".into(),
-                ev.fail(
-                    probe_common::ErrorCode::ApplicationTimeout,
-                    "upload exceeded the session limit",
+        let (line, ev) = {
+            ev.duration_ms = started.elapsed().as_millis() as u64;
+            ev.bytes_received = received;
+            ev.bytes_sent = acked;
+            ev.phase = Some(if received > 0 {
+                Phase::AppDataReceived
+            } else {
+                Phase::HandshakeDone
+            });
+            match outcome {
+                Ok(Ok(())) if received > 0 => {
+                    ev.phase = Some(Phase::Completed);
+                    (format!("done {received}\n"), ev.succeed())
+                }
+                Ok(Ok(())) => (
+                    "empty\n".to_owned(),
+                    ev.fail(ErrorCode::RemoteClosed, "empty upload"),
                 ),
-            ),
+                Ok(Err((code, detail))) => (format!("error {received}\n"), ev.fail(code, detail)),
+                Err(_) => (
+                    format!("timeout {received}\n"),
+                    ev.fail(
+                        ErrorCode::ApplicationTimeout,
+                        "upload exceeded the session limit",
+                    ),
+                ),
+            }
         };
         if self.tx.try_send(ev).is_err() {
             tracing::warn!("event queue full, dropped an upload event");
         }
-        Response::builder()
-            .status(status)
-            .header(http::header::CONTENT_TYPE, "text/plain")
-            .body(Full::new(Bytes::from(msg)).boxed_unsync())
-            .expect("valid response")
+        let _ = tokio::time::timeout(ACK_EVERY * 10, ack.send(Bytes::from(line))).await;
     }
 
     fn route(&self, req: &Request<Incoming>) -> Response<RespBody> {
@@ -282,7 +349,8 @@ impl Service {
                 }
                 let deadline =
                     Instant::now() + Duration::from_secs(self.limits.max_session_seconds);
-                let ev = self.event(req, TestType::Download);
+                let mut ev = self.event(req, TestType::Download);
+                ev.direction = Some(Direction::Down);
                 let body = GenBody::download(bytes, deadline, (self.tx.clone(), ev));
                 Response::builder()
                     .header(http::header::CONTENT_TYPE, "application/octet-stream")
@@ -302,7 +370,8 @@ impl Service {
                 let size: usize = query_param(q, "size")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(64);
-                let ev = self.event(req, TestType::LongSession);
+                let mut ev = self.event(req, TestType::LongSession);
+                ev.direction = Some(Direction::Down);
                 let body = GenBody::session(
                     size,
                     Duration::from_millis(interval_ms),
