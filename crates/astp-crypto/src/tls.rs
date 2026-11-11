@@ -13,12 +13,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::RootCertStore;
 use thiserror::Error;
 
-/// ALPN offered by [`server_config`] and by a QUIC client, in preference order.
+/// ALPN on the QUIC path, for server and client alike.
 ///
+/// Each transport carries only its own protocol: a TLS-over-TCP server that
+/// would agree to `h3`, or a QUIC client that offers `h2`, looks like no
+/// real web server or browser and gives active probing something to see.
 /// `astp-m/1` is intentionally absent. It is not the public default.
-pub const SERVER_ALPN: &[&[u8]] = &[ALPN_H3, ALPN_H2];
+pub const QUIC_ALPN: &[&[u8]] = &[ALPN_H3];
 
-/// ALPN offered by a TCP client.
+/// ALPN on the TLS-over-TCP path, for server and client alike.
 pub const TCP_ALPN: &[&[u8]] = &[ALPN_H2];
 
 /// Certificate chain and private key used as a server identity or as an
@@ -78,6 +81,9 @@ pub struct ServerOptions {
     pub identity: Identity,
     /// `None` is the default profile: no client authentication.
     pub client_auth: Option<ClientAuth>,
+    /// The transport this config is for; it decides the ALPN list. A QUIC
+    /// listener and a TCP listener each get their own config.
+    pub alpn: AlpnMode,
 }
 
 /// Which roots a client trusts. This is a field, not a Cargo feature.
@@ -89,13 +95,23 @@ pub enum TrustAnchors {
     Explicit(RootCertStore),
 }
 
-/// Which ALPN list the client offers. The caller picks the transport.
+/// Which transport a config is for, and so which ALPN list it carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlpnMode {
-    /// QUIC path: [`SERVER_ALPN`].
+    /// QUIC path: [`QUIC_ALPN`].
     Quic,
     /// TCP path: [`TCP_ALPN`].
     Tcp,
+}
+
+impl AlpnMode {
+    /// The ALPN list for this transport.
+    pub fn protocols(self) -> &'static [&'static [u8]] {
+        match self {
+            AlpnMode::Quic => QUIC_ALPN,
+            AlpnMode::Tcp => TCP_ALPN,
+        }
+    }
 }
 
 /// Inputs for [`client_config`].
@@ -120,10 +136,39 @@ impl ClientOptions {
     /// Name rustls must verify for this client.
     ///
     /// An IP literal `host` without a non-empty `tls_server_name` is
-    /// [`CryptoError::IpLiteralRequiresServerName`]. The returned name is
-    /// never an instruction to disable verification.
-    pub fn server_name(&self) -> Result<ServerName<'static>, CryptoError> {
+    /// [`CryptoError::IpLiteralRequiresServerName`]. Transports take the
+    /// name from [`ClientTlsConfig`], not from here.
+    pub(crate) fn server_name(&self) -> Result<ServerName<'static>, CryptoError> {
         resolve_server_name(&self.host, self.tls_server_name.as_deref())
+    }
+}
+
+/// A client config together with the one name it was built to verify.
+///
+/// rustls keeps the server name outside `ClientConfig`, so a config alone
+/// lets a caller hand the connector some other name. Transports take both
+/// from here.
+#[derive(Debug, Clone)]
+pub struct ClientTlsConfig {
+    config: Arc<rustls::ClientConfig>,
+    server_name: ServerName<'static>,
+}
+
+impl ClientTlsConfig {
+    /// The rustls config.
+    pub fn config(&self) -> &Arc<rustls::ClientConfig> {
+        &self.config
+    }
+
+    /// The name the handshake verifies: `tls_server_name`, else `host`.
+    pub fn server_name(&self) -> &ServerName<'static> {
+        &self.server_name
+    }
+
+    /// Both parts, for a connector call such as
+    /// `TlsConnector::from(config).connect(name, io)`.
+    pub fn into_parts(self) -> (Arc<rustls::ClientConfig>, ServerName<'static>) {
+        (self.config, self.server_name)
     }
 }
 
@@ -203,7 +248,8 @@ pub enum CryptoError {
 
 /// Build a TLS 1.3 server config.
 ///
-/// ALPN is [`SERVER_ALPN`]. Early data is disabled. Client authentication
+/// ALPN is [`TCP_ALPN`] or [`QUIC_ALPN`] per [`ServerOptions::alpn`].
+/// Early data is disabled. Client authentication
 /// is disabled unless `client_auth` is [`ClientAuth::Required`]. The
 /// server's own key must be Ed25519 or ECDSA P-256.
 pub fn server_config(options: ServerOptions) -> Result<Arc<rustls::ServerConfig>, CryptoError> {
@@ -234,7 +280,7 @@ pub fn server_config(options: ServerOptions) -> Result<Arc<rustls::ServerConfig>
         .map_err(|err| CryptoError::InvalidIdentity {
             detail: err.to_string(),
         })?;
-    config.alpn_protocols = protocol_list(SERVER_ALPN);
+    config.alpn_protocols = protocol_list(options.alpn.protocols());
     // Refused here, in this config. The tls12 cargo feature stays on.
     config.max_early_data_size = 0;
     config.send_half_rtt_data = false;
@@ -244,14 +290,15 @@ pub fn server_config(options: ServerOptions) -> Result<Arc<rustls::ServerConfig>
 /// Build a TLS 1.3 client config.
 ///
 /// The server name is checked while the config is built, including the
-/// IP-literal rule. Pass [`ClientOptions::server_name`] to the connector.
+/// IP-literal rule, and returned with the config in [`ClientTlsConfig`].
 /// Early data is disabled. There is no option to skip certificate checks.
 /// An mTLS client key, when set, must be Ed25519 or ECDSA P-256. Peer
 /// chains are verified with the ring provider's default algorithms.
-pub fn client_config(options: ClientOptions) -> Result<Arc<rustls::ClientConfig>, CryptoError> {
-    // The name is not stored on ClientConfig. Rejecting it here means an
-    // IP dial without tls_server_name never produces a usable config.
-    let _name = options.server_name()?;
+pub fn client_config(options: ClientOptions) -> Result<ClientTlsConfig, CryptoError> {
+    // The name is not stored on ClientConfig. Resolving it here means an
+    // IP dial without tls_server_name never produces a usable config, and
+    // the config never travels without the name it was meant for.
+    let server_name = options.server_name()?;
     let roots = trust_store(options.trust)?;
     let builder = rustls::ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -270,12 +317,12 @@ pub fn client_config(options: ClientOptions) -> Result<Arc<rustls::ClientConfig>
                 })?
         }
     };
-    config.alpn_protocols = match options.alpn {
-        AlpnMode::Quic => protocol_list(SERVER_ALPN),
-        AlpnMode::Tcp => protocol_list(TCP_ALPN),
-    };
+    config.alpn_protocols = protocol_list(options.alpn.protocols());
     config.enable_early_data = false;
-    Ok(Arc::new(config))
+    Ok(ClientTlsConfig {
+        config: Arc::new(config),
+        server_name,
+    })
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {

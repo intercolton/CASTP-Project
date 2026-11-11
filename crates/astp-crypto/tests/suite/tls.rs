@@ -20,7 +20,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use crate::{
     channel_binding, client_config, server_config, AlpnMode, AuthError, Authenticator,
     ChannelBinding, ClientAuth, ClientId, ClientOptions, CryptoError, Identity, ServerOptions,
-    StaticTokenAuthenticator, TlsSession, TrustAnchors, CHANNEL_BINDING_LEN, SERVER_ALPN, TCP_ALPN,
+    StaticTokenAuthenticator, TlsSession, TrustAnchors, CHANNEL_BINDING_LEN, QUIC_ALPN, TCP_ALPN,
 };
 
 const EXT_PRE_SHARED_KEY: u16 = 41;
@@ -144,6 +144,7 @@ fn configs(
     let server = server_config(ServerOptions {
         identity: server_identity(issued),
         client_auth,
+        alpn: AlpnMode::Tcp,
     })
     .expect("server config");
     let options = client_options(
@@ -153,8 +154,7 @@ fn configs(
         AlpnMode::Tcp,
         client_identity,
     );
-    let name = options.server_name().expect("server name");
-    let client = client_config(options).expect("client config");
+    let (client, name) = client_config(options).expect("client config").into_parts();
     (server, client, name)
 }
 
@@ -505,9 +505,10 @@ async fn tls13_handshake_negotiates_h2() {
             private_key,
         },
         client_auth: None,
+        alpn: AlpnMode::Tcp,
     })
     .expect("server config");
-    assert_eq!(server.alpn_protocols, protocol_vecs(SERVER_ALPN));
+    assert_eq!(server.alpn_protocols, protocol_vecs(TCP_ALPN));
     assert!(server
         .alpn_protocols
         .iter()
@@ -523,19 +524,19 @@ async fn tls13_handshake_negotiates_h2() {
         AlpnMode::Tcp,
         None,
     );
-    let name = tcp.server_name().expect("server name");
+    let (tcp_cfg, name) = client_config(tcp).expect("tcp client").into_parts();
     match &name {
         ServerName::DnsName(dns) => assert_eq!(AsRef::<str>::as_ref(dns), "astp.test"),
         other => panic!("expected a DNS server name, got {other:?}"),
     }
-    let tcp_cfg = client_config(tcp).expect("tcp client");
     assert_eq!(tcp_cfg.alpn_protocols, protocol_vecs(TCP_ALPN));
     assert!(!tcp_cfg.enable_early_data);
 
     let quic = client_options(roots, "astp.test", None, AlpnMode::Quic, None);
     let quic_cfg = client_config(quic).expect("quic client");
-    assert_eq!(quic_cfg.alpn_protocols, protocol_vecs(SERVER_ALPN));
-    assert!(!quic_cfg.enable_early_data);
+    // Only h3 on QUIC: no QUIC client offers h2.
+    assert_eq!(quic_cfg.config().alpn_protocols, protocol_vecs(QUIC_ALPN));
+    assert!(!quic_cfg.config().enable_early_data);
 
     let (client, server_io) = drive(server, tcp_cfg, name).await.expect("handshake");
     assert_eq!(
@@ -557,6 +558,43 @@ async fn tls13_handshake_negotiates_h2() {
     assert_eq!(
         client.get_ref().1.handshake_kind(),
         Some(rustls::HandshakeKind::Full)
+    );
+}
+
+/// A TCP listener never agrees to h3 and a QUIC listener never to h2: each
+/// transport offers only what a real web server offers on it.
+#[test]
+fn server_alpn_follows_the_transport() {
+    let issued = issue(&rcgen::PKCS_ECDSA_P256_SHA256);
+    for (mode, want) in [(AlpnMode::Tcp, TCP_ALPN), (AlpnMode::Quic, QUIC_ALPN)] {
+        let server = server_config(ServerOptions {
+            identity: server_identity(&issued),
+            client_auth: None,
+            alpn: mode,
+        })
+        .expect("server config");
+        assert_eq!(server.alpn_protocols, protocol_vecs(want), "{mode:?}");
+    }
+    assert_eq!(TCP_ALPN, &[astp_types::ALPN_H2]);
+    assert_eq!(QUIC_ALPN, &[astp_types::ALPN_H3]);
+}
+
+/// The name a client verifies comes with its config, from tls_server_name
+/// when set.
+#[test]
+fn client_config_carries_its_server_name() {
+    let issued = issue(&rcgen::PKCS_ECDSA_P256_SHA256);
+    let cfg = client_config(client_options(
+        roots_of(&issued.ca_der),
+        "192.0.2.10",
+        Some("astp.test"),
+        AlpnMode::Tcp,
+        None,
+    ))
+    .expect("client config");
+    assert_eq!(
+        cfg.server_name(),
+        &ServerName::try_from("astp.test").expect("name")
     );
 }
 
@@ -605,6 +643,7 @@ async fn rejects_untrusted_ca_wrong_name_and_ip_without_server_name() {
         server_config(ServerOptions {
             identity: server_identity(&issued),
             client_auth: Some(ClientAuth::Required(RootCertStore::empty())),
+            alpn: AlpnMode::Tcp,
         })
         .expect_err("empty mTLS roots"),
         CryptoError::EmptyTrustAnchors
@@ -618,8 +657,7 @@ async fn rejects_untrusted_ca_wrong_name_and_ip_without_server_name() {
         AlpnMode::Tcp,
         None,
     );
-    let foreign_name = foreign.server_name().expect("foreign name");
-    let foreign_cfg = client_config(foreign).expect("foreign client");
+    let (foreign_cfg, foreign_name) = client_config(foreign).expect("foreign client").into_parts();
     let err = drive(server, foreign_cfg, foreign_name)
         .await
         .expect_err("foreign CA was accepted");
@@ -627,8 +665,9 @@ async fn rejects_untrusted_ca_wrong_name_and_ip_without_server_name() {
 
     let (server, _, _) = configs(&issued, None, None);
     let wrong = client_options(roots.clone(), "not-astp.test", None, AlpnMode::Tcp, None);
-    let wrong_name = wrong.server_name().expect("wrong name");
-    let wrong_cfg = client_config(wrong).expect("wrong-name client");
+    let (wrong_cfg, wrong_name) = client_config(wrong)
+        .expect("wrong-name client")
+        .into_parts();
     let err = drive(server, wrong_cfg, wrong_name)
         .await
         .expect_err("wrong server name was accepted");
@@ -642,8 +681,7 @@ async fn rejects_untrusted_ca_wrong_name_and_ip_without_server_name() {
         tls_server_name: None,
         client_identity: None,
     };
-    let webpki_name = webpki.server_name().expect("webpki name");
-    let webpki_cfg = client_config(webpki).expect("webpki client");
+    let (webpki_cfg, webpki_name) = client_config(webpki).expect("webpki client").into_parts();
     let err = drive(server, webpki_cfg, webpki_name)
         .await
         .expect_err("webpki roots accepted a private CA");
@@ -667,8 +705,7 @@ async fn early_data_is_not_offered_on_resumption() {
         AlpnMode::Tcp,
         None,
     );
-    let name = options.server_name().expect("server name");
-    let client = client_config(options).expect("client config");
+    let (client, name) = client_config(options).expect("client config").into_parts();
     assert!(!client.enable_early_data);
     assert_resumption_omits_early_data(Arc::clone(&harness), Arc::clone(&client), name.clone(), 2)
         .await;
@@ -852,6 +889,7 @@ fn rsa_and_p384_own_keys_are_rejected() {
     ))
     .expect("p256 client");
     let schemes = client
+        .config()
         .crypto_provider()
         .signature_verification_algorithms
         .mapping;
@@ -867,6 +905,7 @@ fn assert_own_key_rejected(issued: &Issued, algorithm: &'static str) {
     let server_err = server_config(ServerOptions {
         identity: server_identity(issued),
         client_auth: None,
+        alpn: AlpnMode::Tcp,
     })
     .expect_err("server accepted a disallowed own key");
     assert_eq!(
@@ -898,6 +937,7 @@ fn missing_pem_is_an_identity_error() {
             private_key: "/no/such/astp-key.pem".into(),
         },
         client_auth: None,
+        alpn: AlpnMode::Tcp,
     })
     .expect_err("missing PEM should fail");
     assert!(matches!(err, CryptoError::Identity { .. }), "{err}");
