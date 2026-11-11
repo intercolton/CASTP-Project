@@ -22,6 +22,10 @@ pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Trust anchors: the Mozilla set, or only the certificates in `ca_file`.
+/// A `ca_file` that cannot be read or holds no certificate is an error,
+/// which the CLI reports once at startup rather than as a certificate
+/// failure on every probe.
 pub fn root_store(ca_file: Option<&Path>) -> Result<rustls::RootCertStore, Failure> {
     let mut roots = rustls::RootCertStore::empty();
     match ca_file {
@@ -39,6 +43,12 @@ pub fn root_store(ca_file: Option<&Path>) -> Result<rustls::RootCertStore, Failu
                     format!("parse CA {}: {e}", path.display()),
                 )
             })?;
+            if certs.is_empty() {
+                return Err(Failure::new(
+                    ErrorCode::Unknown,
+                    format!("CA file {} has no certificate", path.display()),
+                ));
+            }
             for c in certs {
                 roots.add(c).map_err(|e| {
                     Failure::new(

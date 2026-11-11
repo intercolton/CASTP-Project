@@ -52,13 +52,14 @@ struct TestArgs {
     /// Ad-hoc target host (instead of --config)
     #[arg(long, conflicts_with = "config")]
     host: Option<String>,
-    #[arg(long, default_value_t = 443)]
+    /// Port of the ad-hoc target
+    #[arg(long, default_value_t = 443, conflicts_with = "config")]
     port: u16,
     /// TLS server name for ad-hoc targets given as an IP
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     sni: Option<String>,
     /// PEM CA file for ad-hoc targets with a private CA
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     ca_file: Option<PathBuf>,
     /// Bind sockets to this interface (bypass a VPN), e.g. eno1
     #[arg(long)]
@@ -208,6 +209,14 @@ fn build_config(a: &TestArgs) -> Result<ClientConfig> {
     if let Some(n) = &a.network {
         cfg.client.network_id = n.clone();
     }
+    // A CA file that is missing or empty is a configuration error: say so
+    // once instead of reporting a certificate failure on every probe.
+    for t in &cfg.targets {
+        if let Some(ca) = t.ca_file.as_deref() {
+            probe_client::tlsutil::root_store(Some(ca))
+                .map_err(|f| anyhow::anyhow!("target {}: {}", t.id, f.detail))?;
+        }
+    }
     Ok(cfg)
 }
 
@@ -246,6 +255,7 @@ async fn cmd_test(a: TestArgs) -> Result<()> {
             size: a.long_size,
             stall_seconds: a.stall_seconds,
         };
+        plan.check().map_err(|e| anyhow::anyhow!("--long: {e}"))?;
         eprintln!(
             "long session: {} s, {} B every {} ms, freeze after {} s without data",
             plan.seconds, plan.size, plan.interval_ms, plan.stall_seconds
@@ -332,20 +342,30 @@ fn cmd_status(config: Option<PathBuf>) -> Result<()> {
             .join(", ")
     );
     let log = cfg.client.data_dir.join("events.jsonl");
-    match probe_common::jsonl::read_events(&log) {
-        Ok((events, bad)) => {
-            let ok = events.iter().filter(|e| e.success).count();
-            println!(
-                "results:   {} events ({} ok, {} failed), {} unreadable lines in {}",
-                events.len(),
-                ok,
-                events.len() - ok,
-                bad.len(),
-                log.display()
-            );
-        }
-        Err(_) => println!("results:   none yet ({})", log.display()),
+    let files = probe_common::jsonl::rotated_set(&log, cfg.logs.keep_files);
+    if files.is_empty() {
+        println!("results:   none yet ({})", log.display());
+        return Ok(());
     }
+    let (mut total, mut ok, mut bad) = (0usize, 0usize, 0usize);
+    for f in &files {
+        match probe_common::jsonl::read_events(f) {
+            Ok((events, unreadable)) => {
+                total += events.len();
+                ok += events.iter().filter(|e| e.success).count();
+                bad += unreadable.len();
+            }
+            // Rotated away between listing and reading: nothing to count.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => bail!("cannot read {}: {e}", f.display()),
+        }
+    }
+    println!(
+        "results:   {total} events ({ok} ok, {} failed), {bad} unreadable lines in {} file(s) ({}*)",
+        total - ok,
+        files.len(),
+        log.display()
+    );
     Ok(())
 }
 

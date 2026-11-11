@@ -333,6 +333,12 @@ impl ClientConfig {
             if t.host.trim().is_empty() {
                 return bad(format!("target {}: host must not be empty", t.id));
             }
+            if t.port == 0 || t.quic_port == 0 {
+                return bad(format!(
+                    "target {}: port and quic_port must be 1..=65535",
+                    t.id
+                ));
+            }
             if t.role != TargetRole::Both && !t.enable_tls {
                 return bad(format!(
                     "target {}: role {:?} needs enable_tls (directional tests run over TLS + HTTP/2)",
@@ -353,13 +359,13 @@ impl ClientConfig {
             if !ids.insert(c.id.as_str()) {
                 return bad(format!("duplicate id {}", c.id));
             }
-            if !c.url.starts_with("https://") {
-                return bad(format!("control {}: url must be https://", c.id));
+            if let Err(e) = check_https_url(&c.url) {
+                return bad(format!("control {}: {e}", c.id));
             }
         }
         if let Some(d) = &self.delivery {
-            if !d.url.starts_with("https://") {
-                return bad("delivery.url must be https://".into());
+            if let Err(e) = check_https_url(&d.url) {
+                return bad(format!("delivery.url: {e}"));
             }
         }
         Ok(())
@@ -539,6 +545,51 @@ impl ServerConfig {
 /// takes IPv4 by default).
 fn overlaps(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
     a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// Checks that `url` is `https://host[:port][/path]` with a non-empty host
+/// and, if given, a port in 1..=65535. No user info.
+pub fn check_https_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("{url} is not an https:// URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return Err(format!("{url}: user info is not allowed"));
+    }
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (ip, after) = v6
+            .split_once(']')
+            .ok_or_else(|| format!("{url}: unclosed [ in host"))?;
+        if ip.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!("{url}: {ip} is not an IPv6 address"));
+        }
+        match after {
+            "" => (ip, None),
+            p => (
+                ip,
+                Some(
+                    p.strip_prefix(':')
+                        .ok_or_else(|| format!("{url}: junk after ]"))?,
+                ),
+            ),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("{url}: no host"));
+    }
+    if let Some(p) = port {
+        match p.parse::<u16>() {
+            Ok(n) if n > 0 => {}
+            _ => return Err(format!("{url}: port {p:?} is not 1..=65535")),
+        }
+    }
+    Ok(())
 }
 
 fn parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
@@ -778,6 +829,47 @@ listen = "127.0.0.1:9443"
         }
         let t = "[client]\nid=\"x\"\n[logs]\nmax_file_bytes = 4096\nkeep_files = 5000\n";
         assert!(ClientConfig::from_toml(t).is_err());
+    }
+
+    #[test]
+    fn https_urls_are_parsed() {
+        for ok in [
+            "https://www.wikipedia.org/",
+            "https://example.net",
+            "https://example.net:8443/x?y#z",
+            "https://[2001:db8::1]/",
+            "https://[2001:db8::1]:443",
+            "https://192.0.2.1:9443/v1/events",
+        ] {
+            check_https_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "http://example.net/",
+            "https://",
+            "https:///path",
+            "https://example.net:0/",
+            "https://example.net:99999/",
+            "https://example.net:x/",
+            "https://user@example.net/",
+            "https://[2001:db8::1/",
+            "https://[nope]/",
+        ] {
+            assert!(check_https_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn target_port_zero_is_rejected() {
+        let t = "[client]\nid=\"x\"\n[[targets]]\nid=\"a\"\nhost=\"h\"\nport=0\n";
+        assert!(matches!(
+            ClientConfig::from_toml(t),
+            Err(ConfigError::Invalid(_))
+        ));
+        let t = "[client]\nid=\"x\"\n[[targets]]\nid=\"a\"\nhost=\"h\"\nquic_port=0\n";
+        assert!(matches!(
+            ClientConfig::from_toml(t),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

@@ -48,6 +48,31 @@ impl Default for SessionPlan {
     }
 }
 
+impl SessionPlan {
+    /// Rejects plans whose result would be meaningless: a freeze threshold
+    /// shorter than two heartbeat intervals reports every pause as a
+    /// freeze, and a zero threshold times out at once.
+    pub fn check(&self) -> Result<(), String> {
+        if !(1..=3600).contains(&self.seconds) {
+            return Err("long session length must be within 1..=3600 s".into());
+        }
+        if !(100..=60_000).contains(&self.interval_ms) {
+            return Err("heartbeat interval must be within 100..=60000 ms".into());
+        }
+        if self.stall_seconds == 0 {
+            return Err("freeze threshold (--stall-seconds) must be >= 1 s".into());
+        }
+        if self.stall_seconds.saturating_mul(1000) < self.interval_ms.saturating_mul(2) {
+            return Err(format!(
+                "freeze threshold {} s is shorter than two heartbeat intervals ({} ms): every pause would count as a freeze",
+                self.stall_seconds,
+                2 * self.interval_ms
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// How a stream ended, measured from the moment the request went out.
 struct Flow {
     bytes: u64,
@@ -203,11 +228,7 @@ fn request(
     method: http::Method,
     path: &str,
 ) -> http::request::Builder {
-    let authority = if t.port == 443 {
-        t.server_name().to_owned()
-    } else {
-        format!("{}:{}", t.server_name(), t.port)
-    };
+    let authority = crate::probes::authority(t.server_name(), t.port);
     let mut b = http::Request::builder()
         .method(method)
         .uri(format!("https://{authority}{path}"))
@@ -560,5 +581,45 @@ fn ack_line(line: &str) -> AckLine {
     match line.strip_prefix("done ").map(str::parse) {
         Some(Ok(n)) => AckLine::Done(n),
         _ => AckLine::Failed(line.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionPlan;
+
+    #[test]
+    fn plan_check() {
+        let ok = SessionPlan::default();
+        ok.check().unwrap();
+        for bad in [
+            SessionPlan {
+                stall_seconds: 0,
+                ..ok
+            },
+            SessionPlan {
+                stall_seconds: 1,
+                interval_ms: 1000,
+                ..ok
+            },
+            SessionPlan { seconds: 0, ..ok },
+            SessionPlan {
+                seconds: 3601,
+                ..ok
+            },
+            SessionPlan {
+                interval_ms: 50,
+                ..ok
+            },
+        ] {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
+        SessionPlan {
+            stall_seconds: 2,
+            interval_ms: 1000,
+            ..ok
+        }
+        .check()
+        .unwrap();
     }
 }

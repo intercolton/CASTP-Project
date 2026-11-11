@@ -36,11 +36,7 @@ pub async fn h3(ctx: &Ctx, t: &TargetConfig) -> ProbeEvent {
     a.ev.tls_stack = Some(TLS_STACK.into());
     let r = async {
         let q = open(&mut a, ctx, t).await?;
-        let authority = if t.quic_port == 443 {
-            t.server_name().to_owned()
-        } else {
-            format!("{}:{}", t.server_name(), t.quic_port)
-        };
+        let authority = crate::probes::authority(t.server_name(), t.quic_port);
         let uri = format!("https://{authority}{PROBE_PATH}?test_id={}", a.ev.test_id);
         let r = tokio::time::timeout(
             ctx.request_timeout(),

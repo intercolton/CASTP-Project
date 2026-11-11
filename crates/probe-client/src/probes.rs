@@ -273,9 +273,12 @@ pub async fn control(ctx: &Ctx, c: &ControlConfig) -> ProbeEvent {
             .url
             .parse()
             .map_err(|e| Failure::new(ErrorCode::Unknown, format!("bad control url: {e}")))?;
+        // `Uri::host` keeps the brackets of an IPv6 literal ("[::1]").
         let host = uri
             .host()
             .ok_or_else(|| Failure::new(ErrorCode::Unknown, "control url has no host"))?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .to_owned();
         let port = uri.port_u16().unwrap_or(443);
         let path = uri
@@ -317,11 +320,7 @@ async fn http_exchange(
     }
 
     // Host/:authority carries the verified TLS name, not a raw IP.
-    let authority = if port == 443 {
-        server_name.to_owned()
-    } else {
-        format!("{server_name}:{port}")
-    };
+    let authority = authority(server_name, port);
     let test_id = a.ev.test_id.clone();
     let deadline = ctx.request_timeout();
     let max_bytes = ctx.limits.max_test_bytes as usize;
@@ -386,6 +385,20 @@ async fn http_exchange(
         hs.version,
         body_len
     )))
+}
+
+/// `host[:port]` for Host/:authority; an IPv6 literal gets its brackets back.
+pub(crate) fn authority(host: &str, port: u16) -> String {
+    let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 pub(crate) fn http_failure(e: hyper::Error) -> Failure {
@@ -494,6 +507,15 @@ mod tests {
         let (r, note) = first_working(&[live_addr], |a| netutil::connect(a, None, t)).await;
         assert!(r.is_ok());
         assert!(note.is_none());
+    }
+
+    #[test]
+    fn authority_brackets_ipv6() {
+        assert_eq!(authority("probe.test", 443), "probe.test");
+        assert_eq!(authority("probe.test", 8443), "probe.test:8443");
+        assert_eq!(authority("::1", 443), "[::1]");
+        assert_eq!(authority("::1", 8443), "[::1]:8443");
+        assert_eq!(authority("192.0.2.1", 8443), "192.0.2.1:8443");
     }
 
     #[test]
