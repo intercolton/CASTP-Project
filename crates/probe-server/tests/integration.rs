@@ -793,7 +793,10 @@ async fn upload_session_runs_to_the_end() {
     let d = e.detail.as_deref().unwrap();
     // About 2 s / 200 ms heartbeats of 100 B, all acknowledged.
     let sent: u64 = d.split(' ').next().unwrap().parse().unwrap();
-    assert!((800..=1200).contains(&sent) && sent.is_multiple_of(100), "{d}");
+    assert!(
+        (800..=1200).contains(&sent) && sent.is_multiple_of(100),
+        "{d}"
+    );
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     server.shutdown().await.unwrap();
