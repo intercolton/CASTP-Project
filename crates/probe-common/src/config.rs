@@ -113,6 +113,26 @@ pub struct LogsSection {
     pub keep_files: usize,
 }
 
+impl LogsSection {
+    /// Most rotated files kept; bounds what rotation renames each time.
+    pub const MAX_KEEP_FILES: usize = 1000;
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_file_bytes < 1024 {
+            return Err(ConfigError::Invalid(
+                "logs.max_file_bytes must be >= 1024".into(),
+            ));
+        }
+        if self.keep_files > Self::MAX_KEEP_FILES {
+            return Err(ConfigError::Invalid(format!(
+                "logs.keep_files must be <= {}",
+                Self::MAX_KEEP_FILES
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Default for LogsSection {
     fn default() -> Self {
         LogsSection {
@@ -304,9 +324,7 @@ impl ClientConfig {
                 return bad(format!("limits.{name} must be within 1..=120"));
             }
         }
-        if self.logs.max_file_bytes < 1024 {
-            return bad("logs.max_file_bytes must be >= 1024".into());
-        }
+        self.logs.validate()?;
         let mut ids = std::collections::HashSet::new();
         for t in &self.targets {
             if !ids.insert(t.id.as_str()) {
@@ -474,21 +492,29 @@ impl ServerConfig {
             }
         }
         if let Some(a) = &self.admin {
-            if a.listen.parse::<std::net::SocketAddr>().is_err() {
+            let Ok(admin) = a.listen.parse::<std::net::SocketAddr>() else {
                 return bad(format!("admin.listen is not ip:port: {}", a.listen));
+            };
+            let server: std::net::SocketAddr = self.server.listen.parse().expect("checked above");
+            if overlaps(admin, server) {
+                return bad(format!(
+                    "admin.listen {admin} overlaps server.listen {server}: use another port"
+                ));
             }
-            if a.listen == self.server.listen {
-                return bad("admin.listen must differ from server.listen".into());
-            }
-            if let Some(q) = &self.quic.listen {
-                if a.listen == *q {
-                    return bad("admin.listen must differ from quic.listen".into());
+            if let Some(q) = self.quic.listen.as_deref().and_then(|q| q.parse().ok()) {
+                if overlaps(admin, q) {
+                    return bad(format!(
+                        "admin.listen {admin} overlaps quic.listen {q}: use another port"
+                    ));
                 }
             }
         }
         let l = &self.limits;
-        if l.max_connections == 0 {
-            return bad("limits.max_connections must be > 0".into());
+        if !(1..=Self::MAX_CONNECTIONS).contains(&l.max_connections) {
+            return bad(format!(
+                "limits.max_connections must be within 1..={}",
+                Self::MAX_CONNECTIONS
+            ));
         }
         if !(60..=3600).contains(&l.max_session_seconds) {
             return bad("limits.max_session_seconds must be within 60..=3600".into());
@@ -499,8 +525,20 @@ impl ServerConfig {
         {
             return bad("limits must be > 0".into());
         }
+        self.logs.validate()?;
         Ok(())
     }
+
+    /// Upper bound for `limits.max_connections` (a tokio semaphore takes
+    /// far more, but no single probe server needs it).
+    pub const MAX_CONNECTIONS: usize = 65_536;
+}
+
+/// Two listen addresses on the same port collide when the IPs are equal
+/// or either is a wildcard (`0.0.0.0` or `[::]`; on Linux `[::]` also
+/// takes IPv4 by default).
+fn overlaps(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
+    a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 fn parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
@@ -699,6 +737,47 @@ listen = "127.0.0.1:9443"
         assert!(c.targets[1].role.up() && !c.targets[1].role.down());
         let bad = format!("{t}enable_tls=false\n");
         assert!(ClientConfig::from_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn server_rejects_admin_overlapping_a_wildcard() {
+        for (server, admin) in [
+            ("0.0.0.0:443", "[::]:443"),
+            ("[::]:443", "127.0.0.1:443"),
+            ("0.0.0.0:443", "127.0.0.1:443"),
+            ("127.0.0.1:443", "127.0.0.1:443"),
+        ] {
+            let t = SERVER
+                .replacen("0.0.0.0:443", server, 1)
+                .replace("127.0.0.1:9443", admin);
+            assert!(
+                matches!(ServerConfig::from_toml(&t), Err(ConfigError::Invalid(_))),
+                "{server} vs {admin}"
+            );
+        }
+        // Different addresses on the same port, neither a wildcard: fine.
+        let t = SERVER
+            .replacen("0.0.0.0:443", "192.0.2.1:443", 1)
+            .replacen("0.0.0.0:443", "192.0.2.1:443", 1)
+            .replace("127.0.0.1:9443", "127.0.0.1:443");
+        ServerConfig::from_toml(&t).unwrap();
+    }
+
+    #[test]
+    fn server_bounds_connections_and_logs() {
+        for extra in [
+            "[limits]\nmax_connections = 70000\nmax_session_seconds = 60\nmax_session_bytes = 1\nidle_timeout_seconds = 1\nhandshake_timeout_seconds = 1\n",
+            "[logs]\nmax_file_bytes = 100\nkeep_files = 1\n",
+            "[logs]\nmax_file_bytes = 4096\nkeep_files = 5000\n",
+        ] {
+            let t = format!("{SERVER}{extra}");
+            assert!(
+                matches!(ServerConfig::from_toml(&t), Err(ConfigError::Invalid(_))),
+                "{extra}"
+            );
+        }
+        let t = "[client]\nid=\"x\"\n[logs]\nmax_file_bytes = 4096\nkeep_files = 5000\n";
+        assert!(ClientConfig::from_toml(t).is_err());
     }
 
     #[test]

@@ -58,6 +58,28 @@ pub struct Service {
     pub conn_start: Instant,
 }
 
+/// `detail` for a request outside the probe API: status, method, path and
+/// user agent, each cut to 200 characters.
+pub(crate) fn other_detail<B>(req: &Request<B>, status: u16) -> String {
+    let path: String = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .chars()
+        .take(200)
+        .collect();
+    let ua: String = req
+        .headers()
+        .get(http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .chars()
+        .take(200)
+        .collect();
+    format!("{status} {} {path} ua={ua}", req.method())
+}
+
 /// Why a request body broke off: the peer went away (FIN or RST) or sent
 /// something malformed.
 fn abort_code(e: &hyper::Error) -> ErrorCode {
@@ -190,23 +212,7 @@ impl Service {
             TestType::HttpsGet
         };
         let mut ev = self.event(req, tt);
-        let path: String = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/")
-            .chars()
-            .take(200)
-            .collect();
-        let ua: String = req
-            .headers()
-            .get(http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .chars()
-            .take(200)
-            .collect();
-        ev.detail = Some(format!("{status} {} {path} ua={ua}", req.method()));
+        ev.detail = Some(other_detail(req, status));
         ev.phase = Some(Phase::Completed);
         if self.tx.try_send(ev.succeed()).is_err() {
             tracing::warn!("event queue full, dropped a request event");

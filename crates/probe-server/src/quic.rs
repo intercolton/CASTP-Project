@@ -2,7 +2,7 @@
 //! `quic_accept` event, including those whose handshake never completes;
 //! `/probe` and `/echo` over HTTP/3 are logged with the client's test id.
 
-use crate::handler::{request_event, ECHO_BODY, ECHO_PATH, PROBE_BODY, PROBE_PATH};
+use crate::handler::{other_detail, request_event, ECHO_BODY, ECHO_PATH, PROBE_BODY, PROBE_PATH};
 use crate::{drain, tls, Refusals, Shared, SHUTDOWN_GRACE};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -197,6 +197,9 @@ async fn serve_h3(
     let end = loop {
         match h3.accept().await {
             Ok(Some(resolver)) => {
+                // Reap finished streams so a long connection does not keep
+                // one task handle per request it ever served.
+                while streams.try_join_next().is_some() {}
                 requests.fetch_add(1, Ordering::Relaxed);
                 let shared = shared.clone();
                 streams.spawn(async move {
@@ -230,16 +233,20 @@ async fn serve_h3(
                         stream.finish().await
                     }
                     .await;
-                    if let Some(tt) = tt {
+                    {
                         let mut ev = request_event(
                             &shared.cfg.server.id,
                             peer,
                             &req,
-                            tt,
+                            tt.unwrap_or(TestType::H3Request),
                             Transport::Quic,
                             "h3",
                             conn_start,
                         );
+                        if tt.is_none() {
+                            // Outside the probe API, logged as over TCP.
+                            ev.detail = Some(other_detail(&req, status.as_u16()));
+                        }
                         ev.duration_ms = started.elapsed().as_millis() as u64;
                         ev.bytes_sent = body.len() as u64;
                         ev.phase = Some(Phase::Completed);
