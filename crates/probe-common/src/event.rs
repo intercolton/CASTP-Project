@@ -21,7 +21,7 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// precision and in lacking the version 2 fields.
 pub const READABLE_SCHEMA_VERSIONS: std::ops::RangeInclusive<u32> = 1..=SCHEMA_VERSION;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestType {
     DnsResolution,
@@ -59,7 +59,7 @@ impl TestType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Udp,
@@ -70,7 +70,7 @@ pub enum Transport {
 /// Which way the measured payload flows, seen from the client. Set on
 /// directional tests (download, long sessions); in a split-path cascade
 /// the upload and the download legs end on different servers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     /// Client to server.
