@@ -168,7 +168,8 @@ pub(crate) fn validate_ipv4(body: &[u8]) -> Result<(), FrameError> {
         return Err(FrameError::BadIpv4);
     }
     let total = u16::from_be_bytes(copy_at::<2>(body, 2).ok_or(FrameError::BadIpv4)?);
-    if usize::from(total) != body.len() || total < 20 {
+    // `body.len() >= 20` above, so this also rules out total < 20.
+    if usize::from(total) != body.len() {
         return Err(FrameError::BadIpv4);
     }
     Ok(())

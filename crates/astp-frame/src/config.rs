@@ -216,17 +216,13 @@ fn encoded_one_len(tlv: &Tlv) -> Result<usize, FrameError> {
 }
 
 fn decode_one(ty: u16, value: &[u8]) -> Result<Tlv, FrameError> {
-    if let Some(expected) = expected_len(ty) {
-        if value.len() != expected {
-            return Err(FrameError::BadTlvLength {
-                ty,
-                length: value.len(),
-            });
-        }
-    } else {
-        return Ok(Tlv::Raw {
+    let Some(expected) = expected_len(ty) else {
+        return Ok(raw(ty, value));
+    };
+    if value.len() != expected {
+        return Err(FrameError::BadTlvLength {
             ty,
-            value: value.to_vec(),
+            length: value.len(),
         });
     }
 
@@ -289,8 +285,17 @@ fn decode_one(ty: u16, value: &[u8]) -> Result<Tlv, FrameError> {
             },
         )?)),
         TLV_MAX_FRAME => Ok(Tlv::MaxFrame(read_u32(value, ty)?)),
-        // `expected_len` and this match list the same assigned types.
-        _ => Err(FrameError::KnownTlvAsRaw { ty }),
+        // Not reached: every type with an `expected_len` has an arm above
+        // (`every_assigned_tlv_has_a_decoder` checks it). Were one missed,
+        // the value is kept, as for any unassigned type.
+        _ => Ok(raw(ty, value)),
+    }
+}
+
+fn raw(ty: u16, value: &[u8]) -> Tlv {
+    Tlv::Raw {
+        ty,
+        value: value.to_vec(),
     }
 }
 
@@ -449,7 +454,23 @@ mod tests {
 
     use astp_types::TLV_MTU;
 
-    use super::{encode_one, encoded_one_len, Tlv};
+    use super::{decode_one, encode_one, encoded_one_len, expected_len, Tlv};
+
+    /// Every assigned type that has a fixed length decodes to its own
+    /// variant, so the fallback arm of `decode_one` is never taken.
+    #[test]
+    fn every_assigned_tlv_has_a_decoder() {
+        let mut assigned = 0;
+        for ty in 0..=u16::MAX {
+            let Some(len) = expected_len(ty) else {
+                continue;
+            };
+            assigned += 1;
+            let tlv = decode_one(ty, &vec![0u8; len]).unwrap();
+            assert!(!matches!(tlv, Tlv::Raw { .. }), "{ty:#06x} decoded as raw");
+        }
+        assert_eq!(assigned, 11);
+    }
 
     fn assert_same_len(tlv: &Tlv) {
         let mut buf = Vec::new();

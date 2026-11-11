@@ -45,7 +45,9 @@ uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync", "fs"] }
+# No features here: each crate names the ones it uses, so a codec does not
+# pull in the network stack, signals and the multi-threaded runtime.
+tokio = { version = "1", default-features = false }
 tokio-util = "0.7"
 socket2 = { version = "0.6", features = ["all"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -61,6 +63,8 @@ http-body-util = "0.1"
 http = "1"
 bytes = "1"
 rand = "0.9"
+ring = "0.17.14"
+subtle = "2.6.1"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
