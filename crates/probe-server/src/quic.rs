@@ -126,7 +126,7 @@ async fn handle_conn(
 
     let requests = Arc::new(AtomicU64::new(0));
     let max = Duration::from_secs(cfg.limits.max_session_seconds + 30);
-    let serve = tokio::time::timeout(max, serve_h3(&shared, conn.clone(), peer, &requests));
+    let serve = tokio::time::timeout(max, serve_h3(&shared, conn.clone(), peer, &requests, start));
     tokio::pin!(serve);
     let r = tokio::select! {
         r = serve.as_mut() => r.map_err(|_| End::SessionLimit),
@@ -184,6 +184,7 @@ async fn serve_h3(
     conn: quinn::Connection,
     peer: SocketAddr,
     requests: &AtomicU64,
+    conn_start: Instant,
 ) -> Option<String> {
     let mut h3 =
         match h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn)).await {
@@ -237,6 +238,7 @@ async fn serve_h3(
                             tt,
                             Transport::Quic,
                             "h3",
+                            conn_start,
                         );
                         ev.duration_ms = started.elapsed().as_millis() as u64;
                         ev.bytes_sent = body.len() as u64;

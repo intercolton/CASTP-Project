@@ -10,7 +10,16 @@ use crate::error_code::ErrorCode;
 use crate::timefmt;
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// Version written by this build.
+///
+/// - 1: timestamps in whole seconds.
+/// - 2: timestamps with milliseconds; optional `direction`, `pair_id` and
+///   `since_conn_ms`.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Versions this build reads. Version 1 lines differ only in timestamp
+/// precision and in lacking the version 2 fields.
+pub const READABLE_SCHEMA_VERSIONS: std::ops::RangeInclusive<u32> = 1..=SCHEMA_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +130,11 @@ pub struct ProbeEvent {
     pub connect_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handshake_ms: Option<u64>,
+    /// Server side: milliseconds on the server's monotonic clock from the
+    /// accept of the connection to this event's start. Ties request events
+    /// to their `tcp_accept`/`quic_accept` without trusting the wall clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_conn_ms: Option<u64>,
 }
 
 fn default_side() -> Side {
@@ -165,6 +179,7 @@ impl ProbeEvent {
             peer: None,
             connect_ms: None,
             handshake_ms: None,
+            since_conn_ms: None,
         }
     }
 
@@ -187,7 +202,7 @@ impl ProbeEvent {
 
     /// Checks the invariants every written event must hold.
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !READABLE_SCHEMA_VERSIONS.contains(&self.schema_version) {
             return Err(format!("unknown schema_version {}", self.schema_version));
         }
         if timefmt::parse_rfc3339(&self.timestamp).is_none() {
@@ -227,6 +242,19 @@ mod tests {
         assert_eq!(e.duration_ms, 83);
         assert_eq!(e.side, Side::Client);
         e.validate().unwrap();
+    }
+
+    #[test]
+    fn writes_schema_2_with_milliseconds() {
+        let e = sample().succeed();
+        assert_eq!(e.schema_version, 2);
+        // 2026-11-02T12:00:00.123Z
+        assert_eq!(e.timestamp.len(), 24, "{}", e.timestamp);
+        assert_eq!(&e.timestamp[19..20], ".");
+        e.validate().unwrap();
+        let mut future = e.clone();
+        future.schema_version = 3;
+        assert!(future.validate().is_err());
     }
 
     #[test]

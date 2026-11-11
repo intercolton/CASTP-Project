@@ -155,6 +155,7 @@ async fn client_and_server_agree() {
         assert_eq!(s.side, Side::Server);
         assert_eq!(s.test_type, tt);
         assert_eq!(s.bytes_sent, "ok astp\n".len() as u64, "{s:?}");
+        assert!(s.since_conn_ms.is_some(), "{s:?}");
     }
     // One accept per client connection (tcp, tls, https, h2).
     let accepts: Vec<_> = server_events

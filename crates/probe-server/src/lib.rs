@@ -341,6 +341,7 @@ async fn handle_conn(
         limits: cfg.limits.clone(),
         requests: requests.clone(),
         budget: Arc::new(AtomicU64::new(cfg.limits.max_session_bytes)),
+        conn_start: start,
     };
     let timer = hyper_util::rt::TokioTimer::new();
     let idle = Duration::from_secs(cfg.limits.idle_timeout_seconds);

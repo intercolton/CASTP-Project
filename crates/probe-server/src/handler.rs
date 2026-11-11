@@ -45,6 +45,8 @@ pub struct Service {
     /// `/session` and uploads, shared by all its requests: parallel HTTP/2
     /// streams cannot multiply `max_session_bytes`.
     pub budget: Arc<AtomicU64>,
+    /// When the TCP connection was accepted (monotonic).
+    pub conn_start: Instant,
 }
 
 /// Takes up to `want` bytes from `budget`; returns how many were granted.
@@ -97,6 +99,7 @@ pub(crate) fn request_event<B>(
     test_type: TestType,
     transport: Transport,
     alpn: &str,
+    conn_start: Instant,
 ) -> ProbeEvent {
     let test_id = req
         .headers()
@@ -112,6 +115,7 @@ pub(crate) fn request_event<B>(
     ev.side = Side::Server;
     ev.peer = Some(peer.to_string());
     ev.alpn = Some(alpn.into());
+    ev.since_conn_ms = Some(conn_start.elapsed().as_millis() as u64);
     ev
 }
 
@@ -129,6 +133,7 @@ impl Service {
             test_type,
             Transport::Tcp,
             alpn,
+            self.conn_start,
         )
     }
 
