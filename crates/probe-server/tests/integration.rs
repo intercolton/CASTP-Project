@@ -560,3 +560,66 @@ async fn download_detects_freeze_after_kilobytes() {
     assert!(t.elapsed() < Duration::from_secs(15));
     server.shutdown().await.unwrap();
 }
+
+/// A peer that finishes TLS and then says nothing must not hold a
+/// connection slot until the session limit: it is closed after
+/// `idle_timeout_seconds` and the slot is free again.
+#[tokio::test]
+async fn silent_connection_is_closed_after_idle_timeout() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let mut scfg = server_cfg(&pki, data.path(), 5);
+    scfg.limits.max_connections = 1;
+    scfg.limits.idle_timeout_seconds = 1;
+    let server = probe_server::start(scfg).await.unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+
+    // Takes the only slot: handshake, then silence.
+    let tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let tls_cfg =
+        probe_client::tlsutil::client_config(Some(Path::new(&pki.path("ca.pem"))), &[b"h2"], false)
+            .unwrap();
+    let silent =
+        probe_client::tlsutil::handshake(tls_cfg, "probe.test", tcp, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+    // While it holds the slot a second connection is turned away.
+    let busy = collect(
+        &cfg,
+        Selection {
+            h2: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(!busy[0].success, "{:?}", busy[0]);
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let free = collect(
+        &cfg,
+        Selection {
+            h2: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(free[0].success, "slot was not released: {:?}", free[0]);
+    drop(silent);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let idle = sev
+        .iter()
+        .find(|e| {
+            e.test_type == TestType::TcpAccept
+                && e.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("no request"))
+        })
+        .unwrap_or_else(|| panic!("idle close not logged: {sev:#?}"));
+    assert!(!idle.success);
+    assert_eq!(idle.error_code, Some(ErrorCode::ApplicationTimeout));
+    assert!(idle.duration_ms < 5000, "{idle:?}");
+}

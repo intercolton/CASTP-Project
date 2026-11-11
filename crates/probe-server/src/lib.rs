@@ -11,7 +11,7 @@ mod tls;
 use anyhow::{Context, Result};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use probe_common::config::ServerConfig;
-use probe_common::counting::Counting;
+use probe_common::counting::{Counters, Counting};
 use probe_common::jsonl::JsonlWriter;
 use probe_common::{ErrorCode, Phase, ProbeEvent, Side, TestType, Transport};
 use std::net::SocketAddr;
@@ -239,16 +239,29 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
         limits: cfg.limits.clone(),
         requests: requests.clone(),
     };
+    let timer = hyper_util::rt::TokioTimer::new();
+    let idle = Duration::from_secs(cfg.limits.idle_timeout_seconds);
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    // Without a timer hyper silently skips the HTTP/1 header-read timeout.
+    builder
+        .http1()
+        .timer(timer.clone())
+        .header_read_timeout(idle);
     builder
         .http2()
-        .timer(hyper_util::rt::TokioTimer::new())
+        .timer(timer)
         .keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(20))
         .adaptive_window(true);
     let conn = builder.serve_connection(TokioIo::new(tls), svc);
     let max = Duration::from_secs(cfg.limits.max_session_seconds + 30);
-    let result = tokio::time::timeout(max, conn).await;
+    let outcome = tokio::select! {
+        r = tokio::time::timeout(max, conn) => match r {
+            Ok(r) => End::Closed(r),
+            Err(_) => End::SessionLimit,
+        },
+        _ = idle_watch(&counters, idle) => End::Idle,
+    };
 
     let n = requests.load(Ordering::Relaxed);
     if n > 0 {
@@ -258,14 +271,30 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
     ev.bytes_sent = counters.sent();
     ev.bytes_received = counters.received();
     ev.detail = Some(format!("{version}, {n} request(s)"));
-    let ev = match result {
-        Err(_) => ev.fail(
+    let ev = match outcome {
+        End::SessionLimit => ev.fail(
             ErrorCode::ApplicationTimeout,
             "connection exceeded the session limit",
         ),
+        // Keeping a served connection open and then going quiet is what
+        // browsers do; a peer that never asked for anything is not.
+        End::Idle if n > 0 => {
+            ev.detail = Some(format!(
+                "{version}, {n} request(s), closed after {} s idle",
+                idle.as_secs()
+            ));
+            ev.succeed()
+        }
+        End::Idle => ev.fail(
+            ErrorCode::ApplicationTimeout,
+            format!(
+                "no request and no traffic for {} s after the handshake, closed",
+                idle.as_secs()
+            ),
+        ),
         // The connection's job is the handshake; a peer that leaves afterwards,
         // with or without requests, ended it normally (a TLS-only test does).
-        Ok(r) => {
+        End::Closed(r) => {
             // Our own close_notify failing because the peer already left is not news.
             let shutdown_only = matches!(&r, Err(e)
                 if e.downcast_ref::<hyper::Error>().is_some_and(|h| h.is_shutdown()));
@@ -279,4 +308,32 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
         }
     };
     let _ = shared.tx.send(ev).await;
+}
+
+/// How a served connection ended.
+enum End {
+    Closed(std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>),
+    SessionLimit,
+    Idle,
+}
+
+/// Returns once no byte has moved in either direction for `idle`.
+///
+/// Both directions count: in a split-path cascade an upload leg legitimately
+/// sends almost nothing back and a download leg receives almost nothing, so
+/// "nothing received for N s" would cut healthy one-way connections.
+async fn idle_watch(counters: &Counters, idle: Duration) {
+    let tick = (idle / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
+    let mut seen = counters.total();
+    let mut since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(tick).await;
+        let now = counters.total();
+        if now != seen {
+            seen = now;
+            since = tokio::time::Instant::now();
+        } else if since.elapsed() >= idle {
+            return;
+        }
+    }
 }
