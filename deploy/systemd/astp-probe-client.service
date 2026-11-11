@@ -11,9 +11,9 @@ ExecStart=/usr/local/bin/astp-probe run --config /etc/astp-probe/client.toml
 EnvironmentFile=-/etc/astp-probe/client.env
 Restart=on-failure
 RestartSec=3
-# `astp-probe run` exits with 69 (EX_UNAVAILABLE) while scheduling is not
-# implemented: that is not a failure a restart can fix.
-RestartPreventExitStatus=69
+# `astp-probe run` stops cleanly on SIGTERM; give a running long
+# session no reason to be killed hard.
+TimeoutStopSec=15
 
 # Unprivileged transient user; /var/lib/astp-probe is created and owned by it.
 DynamicUser=yes

@@ -4,6 +4,7 @@
 pub mod netutil;
 pub mod probes;
 pub mod quic;
+pub mod schedule;
 pub mod stream;
 pub mod tlsutil;
 

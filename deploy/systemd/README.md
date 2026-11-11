@@ -25,7 +25,7 @@ key_file = "/run/credentials/astp-probe-server.service/key.pem"
 
 ## Клиент
 
-`astp-probe run` ещё не выполняет расписание: процесс завершается с кодом 69 (`EX_UNAVAILABLE`), и `RestartPreventExitStatus=69` не даёт systemd перезапускать его по кругу. `StartLimitIntervalSec=60`/`StartLimitBurst=5` ограничивают перезапуски и для остальных ошибок.
+`astp-probe run` выполняет расписание из `[schedule]` до остановки; по SIGTERM процесс завершается сразу, прерывая идущую пробу. `StartLimitIntervalSec=60`/`StartLimitBurst=5` ограничивают перезапуски при ошибках (например, при неверном конфиге). Для кампании фиксированной длины добавьте к `ExecStart` `--campaign 14d`: по её окончании процесс выходит с кодом 0, и `Restart=on-failure` его не перезапускает.
 
 Для `client.bind_interface` (SO_BINDTODEVICE) юнит даёт `CAP_NET_RAW`. На ядрах Linux 5.7+ привязка к интерфейсу работает и без него; если `bind_interface` не используется, строки `AmbientCapabilities`/`CapabilityBoundingSet` можно убрать.
 

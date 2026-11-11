@@ -996,3 +996,91 @@ async fn h3_unknown_path_is_logged() {
     let d = e.detail.as_deref().unwrap();
     assert!(d.starts_with("404 GET /nope?x=1"), "{d}");
 }
+
+// ------------------------------------------------------------ scheduler ---
+
+#[tokio::test]
+async fn scheduler_alternates_quick_and_long_without_overlap() {
+    use probe_client::schedule::{run_scheduled, Ran, Schedule};
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let sched = Schedule {
+        quick_every: Duration::from_millis(300),
+        long_every: Duration::from_millis(800),
+        long_plan: SessionPlan {
+            seconds: 1,
+            interval_ms: 200,
+            size: 100,
+            stall_seconds: 2,
+        },
+        jitter_percent: 10,
+        campaign: Some(Duration::from_secs(4)),
+        no_long: false,
+    };
+    let mut events = Vec::new();
+    let mut runs = Vec::new();
+    let t = std::time::Instant::now();
+    run_scheduled(
+        &cfg,
+        sched,
+        |e| events.push(e),
+        |r| runs.push(r),
+        std::future::pending(),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
+    assert_eq!(runs.first(), Some(&Ran::Quick), "{runs:?}");
+    let quick = runs.iter().filter(|r| **r == Ran::Quick).count();
+    let long = runs.iter().filter(|r| **r == Ran::Long).count();
+    assert!(quick >= 3 && long >= 1, "{runs:?}");
+    for e in &events {
+        assert!(e.success, "{e:?}");
+    }
+    // role = both: a long pass is a download and an upload session.
+    let sessions = events
+        .iter()
+        .filter(|e| e.test_type == TestType::LongSession)
+        .count();
+    assert_eq!(sessions, 2 * long);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn scheduler_stops_at_once_on_signal() {
+    use probe_client::schedule::{run_scheduled, Schedule};
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let sched = Schedule {
+        quick_every: Duration::from_secs(3600),
+        long_every: Duration::from_millis(1),
+        long_plan: SessionPlan {
+            seconds: 60,
+            interval_ms: 200,
+            size: 100,
+            stall_seconds: 2,
+        },
+        jitter_percent: 0,
+        campaign: None,
+        no_long: false,
+    };
+    let t = std::time::Instant::now();
+    // Stops in the middle of a 60 s long session.
+    run_scheduled(
+        &cfg,
+        sched,
+        |_| {},
+        |_| {},
+        tokio::time::sleep(Duration::from_secs(2)),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    server.shutdown().await.unwrap();
+}

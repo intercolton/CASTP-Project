@@ -9,23 +9,37 @@ fn command() -> Command {
     Command::new(path)
 }
 
-/// `RestartPreventExitStatus=69` in deploy/systemd/astp-probe-client.service
-/// depends on this code.
+/// A campaign with nothing to probe ends on time and exits 0.
 #[test]
-fn run_exits_69_while_not_implemented() {
-    let output = command()
-        .args(["run", "--config", "/nonexistent.toml"])
-        .output()
-        .expect("spawn astp-probe");
-    assert_eq!(output.status.code(), Some(69), "{:?}", output.status);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not implemented"), "stderr was {stderr:?}");
-    let unit = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/systemd/astp-probe-client.service"),
+fn run_ends_with_the_campaign() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("client.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[client]\nid = \"c\"\ndata_dir = '{}'\n",
+            dir.path().join("data").display()
+        ),
     )
     .unwrap();
-    assert!(unit.contains("RestartPreventExitStatus=69"));
+    let t = std::time::Instant::now();
+    let output = command()
+        .args(["run", "--campaign", "1s", "--no-long", "--config"])
+        .arg(&cfg)
+        .output()
+        .expect("spawn astp-probe");
+    assert!(output.status.success(), "{output:?}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(10));
+    assert!(dir.path().join("data/events.jsonl").exists());
+}
+
+#[test]
+fn run_rejects_a_bad_campaign() {
+    let output = command()
+        .args(["run", "--config", "/nonexistent.toml", "--campaign", "5w"])
+        .output()
+        .expect("spawn astp-probe");
+    assert!(!output.status.success());
 }
 
 #[test]

@@ -2,16 +2,13 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use probe_client::schedule::{parse_duration, run_scheduled, Schedule};
 use probe_client::stream::SessionPlan;
 use probe_client::{run_long, run_quick, Selection};
 use probe_common::config::{ClientConfig, ClientSection, TargetConfig};
 use probe_common::jsonl::JsonlWriter;
 use probe_common::ProbeEvent;
 use std::path::PathBuf;
-
-/// EX_UNAVAILABLE (sysexits.h). The systemd unit lists it in
-/// `RestartPreventExitStatus=`, so keep the two in sync.
-const EXIT_NOT_IMPLEMENTED: i32 = 69;
 
 #[derive(Parser)]
 #[command(name = "astp-probe", version, about = "ASTP network probe client")]
@@ -28,6 +25,12 @@ enum Cmd {
     Run {
         #[arg(long)]
         config: PathBuf,
+        /// Stop after this long, e.g. 14d (a measurement campaign)
+        #[arg(long)]
+        campaign: Option<String>,
+        /// Quick tests only, no long sessions
+        #[arg(long)]
+        no_long: bool,
     },
     /// Summarise stored results
     Report {
@@ -120,11 +123,11 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Test(a) => rt.block_on(cmd_test(*a)),
         Cmd::Status { config } => cmd_status(config),
-        Cmd::Run { .. } => {
-            eprintln!("`run` (scheduled tests) is not implemented yet — stage C");
-            // Not a transient failure: the systemd unit stops restarting on it.
-            std::process::exit(EXIT_NOT_IMPLEMENTED);
-        }
+        Cmd::Run {
+            config,
+            campaign,
+            no_long,
+        } => rt.block_on(cmd_run(config, campaign, no_long)),
         Cmd::Report { .. } => bail!("`report` is not implemented yet — stage D"),
     }
 }
@@ -209,14 +212,7 @@ fn build_config(a: &TestArgs) -> Result<ClientConfig> {
     if let Some(n) = &a.network {
         cfg.client.network_id = n.clone();
     }
-    // A CA file that is missing or empty is a configuration error: say so
-    // once instead of reporting a certificate failure on every probe.
-    for t in &cfg.targets {
-        if let Some(ca) = t.ca_file.as_deref() {
-            probe_client::tlsutil::root_store(Some(ca))
-                .map_err(|f| anyhow::anyhow!("target {}: {}", t.id, f.detail))?;
-        }
-    }
+    check_ca_files(&cfg)?;
     Ok(cfg)
 }
 
@@ -273,6 +269,86 @@ async fn cmd_test(a: TestArgs) -> Result<()> {
     }
     if failed > 0 {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn cmd_run(path: PathBuf, campaign: Option<String>, no_long: bool) -> Result<()> {
+    let cfg = ClientConfig::load(&path).with_context(|| format!("load {}", path.display()))?;
+    tracing_subscriber::fmt()
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.client.log_level)),
+        )
+        .init();
+    check_ca_files(&cfg)?;
+    let mut sched = Schedule::from_config(&cfg);
+    sched.no_long = no_long;
+    sched.campaign = campaign
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--campaign: {e}"))?;
+    let log = cfg.client.data_dir.join("events.jsonl");
+    let mut writer = JsonlWriter::open(&log, cfg.logs.max_file_bytes, cfg.logs.keep_files)
+        .with_context(|| format!("open {}", log.display()))?;
+    tracing::info!(
+        targets = cfg.targets.len(),
+        quick_s = cfg.schedule.quick_interval_seconds,
+        long_s = cfg.schedule.long_interval_seconds,
+        campaign = ?sched.campaign,
+        log = %log.display(),
+        "scheduled tests started"
+    );
+    let mut write_errors = 0u64;
+    run_scheduled(
+        &cfg,
+        sched,
+        |ev| {
+            tracing::info!("{}", human(&ev));
+            if let Err(e) = writer.write(&ev) {
+                write_errors += 1;
+                tracing::error!("cannot write event: {e}");
+            }
+        },
+        |ran| tracing::debug!(?ran, "pass finished"),
+        shutdown_signal(),
+    )
+    .await;
+    tracing::info!("stopped");
+    if write_errors > 0 {
+        bail!(
+            "{write_errors} event(s) could not be written to {}",
+            log.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+/// A CA file that is missing or empty is a configuration error: say so
+/// once instead of reporting a certificate failure on every probe.
+fn check_ca_files(cfg: &ClientConfig) -> Result<()> {
+    for t in &cfg.targets {
+        if let Some(ca) = t.ca_file.as_deref() {
+            probe_client::tlsutil::root_store(Some(ca))
+                .map_err(|f| anyhow::anyhow!("target {}: {}", t.id, f.detail))?;
+        }
     }
     Ok(())
 }
