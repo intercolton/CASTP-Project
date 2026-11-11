@@ -4,8 +4,9 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     ports:
-      - "443:443/tcp"
-      - "443:443/udp"
+      # 443 остаётся шлюзу ASTP-M.
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
     volumes:
       - ./server.toml:/etc/astp-probe/server.toml:ro
       # Пути совпадают с [tls] в configs/server.example.toml. Файлы должны

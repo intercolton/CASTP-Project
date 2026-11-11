@@ -10,6 +10,6 @@ FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d
 RUN useradd --system --create-home --home-dir /var/lib/astp-probe astp
 COPY --from=build /src/target/release/astp-probe-server /usr/local/bin/astp-probe-server
 USER astp
-EXPOSE 443/tcp 443/udp
+EXPOSE 8443/tcp 8443/udp
 ENTRYPOINT ["astp-probe-server"]
 CMD ["--config", "/etc/astp-probe/server.toml"]

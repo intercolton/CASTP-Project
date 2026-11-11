@@ -33,7 +33,8 @@ keep_files = 8
 [[targets]]
 id = "gateway-01"
 host = "probe.example.net"
-port = 443
+port = 8443
+quic_port = 8443
 enable_tcp = true
 enable_tls = true
 enable_h2 = true

@@ -27,7 +27,7 @@ astp-probe status --config configs/client.example.toml
 |---|---|
 | `tls_certificate_error` | Имя в сертификате, `tls_server_name`, файл `ca_file`. Пустой или нечитаемый `ca_file` клиент отвергает при запуске, а не на каждой пробе |
 | `tcp_refused` | Слушает ли сервер указанный порт |
-| `quic_timeout` при живом TCP | UDP/443, а не вывод «это DPI» |
+| `quic_timeout` при живом TCP | Доходит ли UDP на `quic_port` (в примере 8443), а не вывод «это DPI» |
 | `unsupported` | Эта сборка или эта ОС так не умеет. На Linux привязка к интерфейсу есть, на Windows нет |
 
 ## Удаление

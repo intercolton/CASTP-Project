@@ -6,7 +6,12 @@
 
 ## Сервер
 
-Порт 443 открывается без root через `CAP_NET_BIND_SERVICE`.
+Пример слушает порт 8443 (TCP и UDP), для него привилегии не нужны, и юнит не даёт процессу никаких capabilities (`CapabilityBoundingSet=` пустой). Если пробник ставится на отдельную машину без шлюза и должен слушать порт ниже 1024, добавьте в юнит:
+
+```ini
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+```
 
 Сертификат и ключ лежат в `/etc/astp-probe/cert.pem` и `/etc/astp-probe/key.pem` с правами только для root (`0600`). systemd копирует их через `LoadCredential=` в `/run/credentials/astp-probe-server.service/`, откуда их может читать только процесс сервиса. Поэтому в `server.toml` для systemd пути другие, чем в примере:
 
