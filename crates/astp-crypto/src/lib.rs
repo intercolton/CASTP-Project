@@ -37,11 +37,16 @@
 #![warn(missing_docs)]
 
 mod auth;
+mod credential;
 mod tls;
 
 pub use auth::{
     channel_binding, AuthError, Authenticator, ChannelBinding, ClientId, TlsSession,
     CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN,
+};
+pub use credential::{
+    client_credential, client_credential_header, decode_credential_header, ClientSecret,
+    DuplicateKey, KeyTable, CREDENTIAL_LEN, CREDENTIAL_VERSION, KEY_ID_LEN, SECRET_LEN,
 };
 pub use tls::{
     client_config, server_config, AlpnMode, ClientAuth, ClientOptions, ClientTlsConfig,

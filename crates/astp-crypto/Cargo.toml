@@ -8,9 +8,9 @@ rust-version.workspace = true
 
 [features]
 default = []
-# Reference HMAC authenticator for tests of later tasks.
+# StaticTokenAuthenticator, the reference authenticator for tests.
 # Not a default feature and not a production credential format.
-test-util = ["dep:ring", "dep:subtle"]
+test-util = []
 
 [dependencies]
 astp-types.workspace = true
@@ -18,13 +18,12 @@ thiserror.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 webpki-roots.workspace = true
-ring = { workspace = true, optional = true }
-subtle = { workspace = true, optional = true }
+ring.workspace = true
+subtle.workspace = true
+data-encoding.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
-ring.workspace = true
-subtle.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
 tokio-rustls.workspace = true

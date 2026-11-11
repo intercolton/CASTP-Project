@@ -119,6 +119,7 @@ name = "astp-crypto"
 version = "0.1.0"
 dependencies = [
  "astp-types",
+ "data-encoding",
  "rcgen",
  "ring",
  "rustls",
