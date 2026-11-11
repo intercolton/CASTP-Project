@@ -9,6 +9,10 @@ use probe_common::jsonl::JsonlWriter;
 use probe_common::ProbeEvent;
 use std::path::PathBuf;
 
+/// EX_UNAVAILABLE (sysexits.h). The systemd unit lists it in
+/// `RestartPreventExitStatus=`, so keep the two in sync.
+const EXIT_NOT_IMPLEMENTED: i32 = 69;
+
 #[derive(Parser)]
 #[command(name = "astp-probe", version, about = "ASTP network probe client")]
 struct Cli {
@@ -115,7 +119,11 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Test(a) => rt.block_on(cmd_test(*a)),
         Cmd::Status { config } => cmd_status(config),
-        Cmd::Run { .. } => bail!("`run` (scheduled tests) is not implemented yet — stage C"),
+        Cmd::Run { .. } => {
+            eprintln!("`run` (scheduled tests) is not implemented yet — stage C");
+            // Not a transient failure: the systemd unit stops restarting on it.
+            std::process::exit(EXIT_NOT_IMPLEMENTED);
+        }
         Cmd::Report { .. } => bail!("`report` is not implemented yet — stage D"),
     }
 }

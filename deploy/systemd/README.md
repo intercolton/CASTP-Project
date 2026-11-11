@@ -1,7 +1,27 @@
 # systemd
 
-Юниты рассчитаны на установку бинарников в `/usr/local/bin` и конфигурации в `/etc/astp-probe`. Каталог данных в примерах TOML — `/var/lib/astp-probe`.
+Юниты рассчитаны на установку бинарников в `/usr/local/bin` и конфигурации в `/etc/astp-probe`.
 
-`astp-probe run` внутри клиентского юнита ещё не выполняет расписание: процесс сразу завершится с сообщением, что этап не реализован. Серверный юнит можно использовать после сборки `astp-probe-server`.
+Оба юнита работают от временного непривилегированного пользователя (`DynamicUser=yes`). Каталог данных `/var/lib/astp-probe` systemd создаёт сам (`StateDirectory=`) и отдаёт этому пользователю; создавать его заранее не нужно. В TOML `data_dir` должен указывать на `/var/lib/astp-probe`.
+
+## Сервер
+
+Порт 443 открывается без root через `CAP_NET_BIND_SERVICE`.
+
+Сертификат и ключ лежат в `/etc/astp-probe/cert.pem` и `/etc/astp-probe/key.pem` с правами только для root (`0600`). systemd копирует их через `LoadCredential=` в `/run/credentials/astp-probe-server.service/`, откуда их может читать только процесс сервиса. Поэтому в `server.toml` для systemd пути другие, чем в примере:
+
+```toml
+[tls]
+cert_file = "/run/credentials/astp-probe-server.service/cert.pem"
+key_file = "/run/credentials/astp-probe-server.service/key.pem"
+```
+
+После обновления сертификата (например, certbot) нужен `systemctl restart astp-probe-server`: копия в `/run/credentials` обновляется только при запуске.
+
+## Клиент
+
+`astp-probe run` ещё не выполняет расписание: процесс завершается с кодом 69 (`EX_UNAVAILABLE`), и `RestartPreventExitStatus=69` не даёт systemd перезапускать его по кругу. `StartLimitIntervalSec=60`/`StartLimitBurst=5` ограничивают перезапуски и для остальных ошибок.
+
+Для `client.bind_interface` (SO_BINDTODEVICE) юнит даёт `CAP_NET_RAW`. На ядрах Linux 5.7+ привязка к интерфейсу работает и без него; если `bind_interface` не используется, строки `AmbientCapabilities`/`CapabilityBoundingSet` можно убрать.
 
 На чистой Ubuntu 24.04 эта установка пока не прогонялась.
