@@ -111,7 +111,22 @@ name = "astp-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astp-crypto",
+ "astp-frame",
+ "astp-server",
+ "astp-session",
+ "astp-transport",
+ "astp-tun",
  "clap",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -148,7 +163,22 @@ name = "astp-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astp-crypto",
+ "astp-frame",
+ "astp-session",
+ "astp-transport",
+ "astp-tun",
+ "bytes",
  "clap",
+ "rand 0.9.5",
+ "rustls",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

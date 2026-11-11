@@ -23,6 +23,12 @@ pub struct ByteReader {
 }
 
 impl ByteReader {
+    /// A reader that is already at EOF.
+    pub fn closed() -> Self {
+        let (_tx, rx) = mpsc::channel(1);
+        ByteReader::new(rx)
+    }
+
     pub(crate) fn new(rx: mpsc::Receiver<io::Result<Bytes>>) -> Self {
         ByteReader {
             rx,
