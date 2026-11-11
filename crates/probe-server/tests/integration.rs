@@ -944,3 +944,55 @@ async fn paired_probe_joins_both_servers() {
         assert_eq!(s.direction, Some(dir));
     }
 }
+
+/// HTTP/3 requests outside the probe API are logged like over TCP:
+/// status, method and path in `detail`. (Review 3.5.)
+#[tokio::test]
+async fn h3_unknown_path_is_logged() {
+    use bytes::Buf;
+    use std::sync::Arc;
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(with_quic(server_cfg(&pki, data.path(), 5)))
+        .await
+        .unwrap();
+    let qaddr = server.quic_addr.unwrap();
+
+    let tls =
+        probe_client::tlsutil::client_config(Some(Path::new(&pki.path("ca.pem"))), &[b"h3"], true)
+            .unwrap();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let conn = ep.connect(qaddr, "probe.test").unwrap().await.unwrap();
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
+        .await
+        .unwrap();
+    let drive = tokio::spawn(async move { driver.wait_idle().await });
+    let req = http::Request::get(format!("https://probe.test:{}/nope?x=1", qaddr.port()))
+        .header("x-astp-test-id", "h3-unknown")
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(req).await.unwrap();
+    stream.finish().await.unwrap();
+    let resp = stream.recv_response().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+        chunk.advance(chunk.remaining());
+    }
+    drop(send);
+    conn.close(0x100u32.into(), b"done");
+    drive.abort();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let e = sev
+        .iter()
+        .find(|e| e.test_id == "h3-unknown")
+        .unwrap_or_else(|| panic!("unknown h3 path not logged: {sev:#?}"));
+    assert_eq!(e.test_type, TestType::H3Request);
+    assert_eq!(e.transport, probe_common::Transport::Quic);
+    let d = e.detail.as_deref().unwrap();
+    assert!(d.starts_with("404 GET /nope?x=1"), "{d}");
+}

@@ -233,30 +233,28 @@ async fn serve_h3(
                         stream.finish().await
                     }
                     .await;
-                    {
-                        let mut ev = request_event(
-                            &shared.cfg.server.id,
-                            peer,
-                            &req,
-                            tt.unwrap_or(TestType::H3Request),
-                            Transport::Quic,
-                            "h3",
-                            conn_start,
-                        );
-                        if tt.is_none() {
-                            // Outside the probe API, logged as over TCP.
-                            ev.detail = Some(other_detail(&req, status.as_u16()));
-                        }
-                        ev.duration_ms = started.elapsed().as_millis() as u64;
-                        ev.bytes_sent = body.len() as u64;
-                        ev.phase = Some(Phase::Completed);
-                        let ev = match sent {
-                            Ok(()) => ev.succeed(),
-                            Err(e) => ev.fail(ErrorCode::RemoteClosed, e.to_string()),
-                        };
-                        if shared.tx.try_send(ev).is_err() {
-                            tracing::warn!("event queue full, dropped a request event");
-                        }
+                    let mut ev = request_event(
+                        &shared.cfg.server.id,
+                        peer,
+                        &req,
+                        tt.unwrap_or(TestType::H3Request),
+                        Transport::Quic,
+                        "h3",
+                        conn_start,
+                    );
+                    if tt.is_none() {
+                        // Outside the probe API, logged as over TCP.
+                        ev.detail = Some(other_detail(&req, status.as_u16()));
+                    }
+                    ev.duration_ms = started.elapsed().as_millis() as u64;
+                    ev.bytes_sent = body.len() as u64;
+                    ev.phase = Some(Phase::Completed);
+                    let ev = match sent {
+                        Ok(()) => ev.succeed(),
+                        Err(e) => ev.fail(ErrorCode::RemoteClosed, e.to_string()),
+                    };
+                    if shared.tx.try_send(ev).is_err() {
+                        tracing::warn!("event queue full, dropped a request event");
                     }
                 });
             }
