@@ -2,7 +2,7 @@
 
 Клиент-серверная диагностика сети для проекта ASTP-M. Пробник измеряет доступность TCP, TLS, HTTP/2, QUIC и HTTP/3 на собственных тестовых узлах. Пробник — не VPN и не средство обхода фильтрации.
 
-В том же Cargo workspace лежит каркас VPN ASTP-M (крейты `astp-*`). Это не пробник и не подменяет `astp-probe` / `astp-probe-server`. Туннель и handshake ещё не реализованы: бинарники `astp-client` и `astp-server` завершаются с кодом 1 и сообщением `not implemented`.
+В том же Cargo workspace лежит VPN ASTP-M v1 (крейты `astp-*`, бинарники `astp-server` и `astp-client`). Это не пробник и не подменяет `astp-probe` / `astp-probe-server`. Решения, на которых он построен, — в [`docs/design/`](docs/design/README.md); установка — [`docs/vpn.md`](docs/vpn.md).
 
 Шлюз ASTP-M по умолчанию займёт порт 443 (UDP и TCP). Пробник запускается на другом порту или на другой машине: примеры конфигурации, Docker и systemd используют порт 8443 (TCP и UDP). Раскладка портов на узлах каскада — в `docs/architecture.md`. Публичный ALPN на проводе — `h3` (QUIC) и `h2` (TCP + TLS). Токен `astp-m/1` только запасной и внутренний, не дефолт публичного профиля. ALPN-мультиплекс пробника и VPN не планируется.
 
@@ -12,7 +12,7 @@
 
 Toolchain — Rust 1.89 (MSRV), edition 2021. Это не Rust 1.98 и не edition 2024. MSRV поднят с 1.85, потому что в `Cargo.lock` стоят `uuid` 1.29.0 (`rust-version` 1.89.0), `time` 0.3.55 (`rust-version` 1.88.0) и `rcgen` 0.14.10 (`rust-version` 1.88). Понизить эти версии в lockfile технически можно; проект решил этого не делать.
 
-Эталон сборки и CI — Ubuntu 24.04 x86_64. Целевой сервер v1 — Linux VPS с ядром не ниже 5.15, архитектуры x86_64 и aarch64: основной артефакт — musl и Docker, запасной — glibc. Туннельный режим требует `/dev/net/tun` и `CAP_NET_ADMIN`. Параллельный каскад (два сервера) в v1 не входит. Этот каркас не содержит платформенных зависимостей, Docker-образа VPN и CI-матрицы.
+Эталон сборки и CI — Ubuntu 24.04 x86_64. Целевой сервер v1 — Linux VPS с ядром не ниже 5.15, архитектуры x86_64 и aarch64: основной артефакт — musl и Docker, запасной — glibc. Туннельный режим требует `/dev/net/tun` и `CAP_NET_ADMIN`. Параллельный каскад (два сервера) в v1 не входит. Docker-образа VPN пока нет.
 
 ## Структура
 
@@ -28,14 +28,14 @@ Toolchain — Rust 1.89 (MSRV), edition 2021. Это не Rust 1.98 и не edit
 │   ├── probe-server/      сервер диагностики astp-probe-server
 │   ├── probe-analyzer/    разбор журналов, стыковка клиента и сервера, статистика
 │   ├── probe-report/      текстовый и HTML-отчёт
-│   ├── astp-types/        каркас типов ASTP-M (VPN в разработке, не пробник)
+│   ├── astp-types/        константы ASTP-M
 │   ├── astp-frame/        кодек кадров ASTP-M v1 (не пробник, не транспорт)
 │   ├── astp-crypto/       TLS 1.3 и контракт Authenticator (не пробник, не транспорт)
-│   ├── astp-transport/    каркас транспорта ASTP-M (VPN в разработке, не пробник)
-│   ├── astp-session/      каркас сессии ASTP-M (VPN в разработке, не пробник)
-│   ├── astp-tun/          каркас TUN ASTP-M (VPN в разработке, не пробник)
-│   ├── astp-client/       CLI astp-client (VPN в разработке, не пробник)
-│   └── astp-server/       сервер astp-server (VPN в разработке, не пробник)
+│   ├── astp-transport/    сессия внутри HTTP/2 (TLS) и HTTP/3 (QUIC), сайт-прикрытие
+│   ├── astp-session/      CONFIG, keepalive, WINDOW, обмен пакетами
+│   ├── astp-tun/          устройство TUN, адреса и маршруты (Linux)
+│   ├── astp-client/       VPN-клиент astp-client
+│   └── astp-server/       VPN-сервер astp-server
 ├── configs/               примеры TOML
 ├── deploy/
 │   ├── systemd/
@@ -56,8 +56,7 @@ Toolchain — Rust 1.89 (MSRV), edition 2021. Это не Rust 1.98 и не edit
 - Запись и ротация JSONL.
 - Диагностический сервер: TCP/TLS, HTTP/1.1, HTTP/2, QUIC и HTTP/3, echo, download, длительная сессия.
 - CLI пробника: `test`, `status` и `run` (расписание с джиттером, кампания `--campaign 14d`). `report` сводит журналы клиента и сервера в текстовый, JSON- или HTML-отчёт.
-- Каркас крейтов `astp-*`. Бинарники `astp-client` и `astp-server` отказываются: в stderr есть `not implemented`, код выхода 1.
-- Кадры прикладного слоя (спека 0.3 §5) кодирует `astp-frame`. `astp-crypto` задаёт конфиг TLS 1.3 и контракт аутентификатора. Туннель, слушатели QUIC/TCP, handshake сессии и TUN ещё не реализованы.
+- VPN ASTP-M v1: кадры (`astp-frame`, спека 0.3 §5), TLS 1.3 и учётные данные с привязкой к каналу (`astp-crypto`), сессия (`astp-session`), транспорт HTTP/2 и HTTP/3 за сайтом-прикрытием (`astp-transport`), TUN (`astp-tun`), бинарники `astp-server` и `astp-client`. Сквозные автотесты идут на localhost без TUN; прогона на двух машинах ещё не было.
 
 Неподдерживаемая команда завершается ошибкой. Успех теста не подменяется заглушкой.
 
@@ -70,6 +69,6 @@ cargo build --release --workspace
 
 Бинарники пробника: `astp-probe`, `astp-probe-server`.
 
-Бинарники каркаса VPN: `astp-client`, `astp-server` (пока `not implemented`).
+Бинарники VPN: `astp-server`, `astp-client`.
 
 Дальше по ТЗ пробника: доставка результатов на административный порт и проверка на эталонной Ubuntu 24.04 x86_64.

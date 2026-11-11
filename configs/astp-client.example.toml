@@ -1,0 +1,13 @@
+# Пример клиента ASTP-M v1.
+
+[client]
+server = "vpn.example.net:443"
+# tls_server_name = "vpn.example.net"   # если server задан IP-адресом
+# ca_file = "/etc/astp/ca.pem"          # только для частного CA
+transport = "auto"                       # auto: HTTP/3, при неудаче HTTP/2
+session_path = "/replace-with-keygen-output"
+secret_env = "ASTP_SECRET"
+device = "astp0"
+set_dns = false
+log_level = "info"
+connect_timeout_seconds = 10

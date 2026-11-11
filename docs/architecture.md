@@ -7,10 +7,10 @@
 | Крейт | Роль | Состояние |
 |---|---|---|
 | `probe-common` | Схема JSONL, коды ошибок, TOML, ротация журнала | Есть |
-| `probe-client` | Пробы и CLI `astp-probe` | Пробы и `test`/`status` есть. `run` и `report` ещё нет |
+| `probe-client` | Пробы и CLI `astp-probe` | Есть: `test`, `status`, `run`, `report` |
 | `probe-server` | TCP/TLS/HTTP/2 на одном порту, QUIC/HTTP/3 на UDP | Есть |
-| `probe-analyzer` | Слияние клиентских и серверных событий, статистика | Каркас |
-| `probe-report` | HTML-отчёт | Каркас |
+| `probe-analyzer` | Слияние клиентских и серверных событий, статистика | Есть |
+| `probe-report` | Текстовый и HTML-отчёт | Есть |
 
 ## Библиотеки
 
@@ -46,4 +46,4 @@ TCP/TLS/HTTP/2 делят один TCP-порт, QUIC слушает UDP с те
 
 ## Вне этой версии
 
-Полноценный VPN, TUN, handshake ASTP-M, MASQUE, ротация IP, панель пользователей и обход фильтрации как функция сюда не входят.
+Пробник не содержит VPN, TUN и handshake ASTP-M: они живут в крейтах `astp-*` (см. [design/](design/README.md)). MASQUE, ротация IP и панель пользователей не входят ни в пробник, ни в VPN v1.
