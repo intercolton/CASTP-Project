@@ -154,6 +154,14 @@ dependencies = [
 [[package]]
 name = "astp-session"
 version = "0.1.0"
+dependencies = [
+ "astp-frame",
+ "astp-types",
+ "rand 0.9.5",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "astp-transport"

@@ -118,6 +118,14 @@ impl Ipv4Packet {
     }
 }
 
+impl Ipv4Packet {
+    /// The raw packet, consuming the wrapper.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 impl AsRef<[u8]> for Ipv4Packet {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
@@ -150,6 +158,14 @@ impl Ipv6Packet {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+impl Ipv6Packet {
+    /// The raw packet, consuming the wrapper.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 
