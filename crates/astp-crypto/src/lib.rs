@@ -1,8 +1,9 @@
 //! ASTP-M TLS 1.3 configuration and the channel-bound authenticator.
 //!
 //! This crate does not open sockets, speak HTTP, or define a production
-//! credential format. QUIC and TCP listeners are later tasks. The network
-//! probe is a different set of crates and is not used here.
+//! credential format. With the `quinn` feature it can read the ASTP-M
+//! exporter from a `quinn::Connection`. The network probe is a different
+//! set of crates and is not used here.
 //!
 //! # Invariants
 //!
@@ -13,7 +14,8 @@
 //!   `send_half_rtt_data` to false. Clients set `enable_early_data` to false.
 //! * The server name is verified. Nothing in this crate turns certificate
 //!   or name checks off. An IP literal dial host without `tls_server_name`
-//!   is a configuration error.
+//!   is a configuration error. [`client_tls`] returns a [`ClientTls`] whose
+//!   name is fixed; the transport does not take a separate server name.
 //! * Server ALPN is [`SERVER_ALPN`] (`h3`, then `h2`). A QUIC client offers
 //!   the same list. A TCP client offers [`TCP_ALPN`] (`h2` only).
 //!   `astp-m/1` is not offered.
@@ -42,8 +44,8 @@ pub use auth::{
     CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN,
 };
 pub use tls::{
-    client_config, server_config, AlpnMode, ClientAuth, ClientOptions, CryptoError, Identity,
-    ServerOptions, TrustAnchors, SERVER_ALPN, TCP_ALPN,
+    client_tls, server_config, AlpnMode, ClientAuth, ClientOptions, ClientTls, CryptoError,
+    Identity, ServerOptions, TrustAnchors, SERVER_ALPN, TCP_ALPN,
 };
 
 #[cfg(any(test, feature = "test-util"))]

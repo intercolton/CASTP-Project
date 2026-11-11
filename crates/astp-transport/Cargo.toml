@@ -1,12 +1,30 @@
 [package]
 name = "astp-transport"
-description = "ASTP-M transport crate (skeleton)"
+description = "ASTP-M QUIC and HTTP/3 transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+astp-crypto = { workspace = true, features = ["quinn"] }
+astp-frame.workspace = true
+astp-types.workspace = true
+bytes.workspace = true
+h3.workspace = true
+h3-datagram.workspace = true
+h3-quinn = { workspace = true, features = ["datagram"] }
+http.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+astp-crypto = { workspace = true, features = ["quinn", "test-util"] }
+rcgen.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

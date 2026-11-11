@@ -118,8 +118,9 @@ mod sealed {
 /// A rustls session that can produce the ASTP-M channel binding.
 ///
 /// Implemented for [`rustls::Connection`], [`rustls::ClientConnection`], and
-/// [`rustls::ServerConnection`]. The trait is sealed. QUIC uses a separate
-/// exporter path in a later task.
+/// [`rustls::ServerConnection`]. The trait is sealed. With the `quinn`
+/// feature it is also implemented for `quinn::Connection`, using the same
+/// label, length, and empty context.
 pub trait TlsSession: sealed::Sealed {
     /// Write this session's exporter output into `output`.
     ///
@@ -145,6 +146,19 @@ macro_rules! impl_tls_session {
 impl_tls_session!(rustls::ClientConnection);
 impl_tls_session!(rustls::ServerConnection);
 impl_tls_session!(rustls::Connection);
+
+#[cfg(feature = "quinn")]
+impl sealed::Sealed for quinn::Connection {}
+
+#[cfg(feature = "quinn")]
+impl TlsSession for quinn::Connection {
+    fn export_astp_channel_binding(&self, output: &mut [u8]) -> Result<(), rustls::Error> {
+        // Quinn forwards `context` as `Some(context)`. An empty slice is the
+        // same exporter input rustls uses for `None`: both hash zero bytes.
+        self.export_keying_material(output, CHANNEL_BINDING_LABEL.as_bytes(), &[])
+            .map_err(|_| rustls::Error::General("QUIC channel-binding exporter failed".into()))
+    }
+}
 
 /// Derive the channel binding from a completed rustls session.
 ///

@@ -17,9 +17,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+use crate::tls::client_config;
 use crate::{
-    channel_binding, client_config, server_config, AlpnMode, AuthError, Authenticator,
-    ChannelBinding, ClientAuth, ClientId, ClientOptions, CryptoError, Identity, ServerOptions,
+    channel_binding, client_tls, server_config, AlpnMode, AuthError, Authenticator, ChannelBinding,
+    ClientAuth, ClientId, ClientOptions, CryptoError, Identity, ServerOptions,
     StaticTokenAuthenticator, TlsSession, TrustAnchors, CHANNEL_BINDING_LEN, SERVER_ALPN, TCP_ALPN,
 };
 
@@ -568,6 +569,33 @@ async fn tls12_only_client_is_rejected() {
         .await
         .expect_err("TLS 1.2 client was accepted");
     assert_tls_refusal(&err, "tls 1.2");
+}
+
+#[test]
+fn client_tls_fixes_the_server_name() {
+    let issued = issue(&rcgen::PKCS_ECDSA_P256_SHA256);
+    let tls = client_tls(client_options(
+        roots_of(&issued.ca_der),
+        "127.0.0.1",
+        Some("astp.test"),
+        AlpnMode::Quic,
+        None,
+    ))
+    .expect("client tls");
+    assert_eq!(
+        tls.server_name(),
+        &ServerName::try_from("astp.test").expect("dns name")
+    );
+    assert!(!tls.config().enable_early_data);
+    let err = client_tls(client_options(
+        roots_of(&issued.ca_der),
+        "127.0.0.1",
+        None,
+        AlpnMode::Quic,
+        None,
+    ))
+    .expect_err("ip without name");
+    assert_eq!(err, CryptoError::IpLiteralRequiresServerName);
 }
 
 #[tokio::test]

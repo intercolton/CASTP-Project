@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "rustls::client::ClientConfig::dangerous", reason = "ASTP-M: проверку сертификата не отключаем" },
+]
