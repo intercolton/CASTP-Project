@@ -190,6 +190,12 @@ dependencies = [
 [[package]]
 name = "astp-tun"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "astp-types"

@@ -1,12 +1,19 @@
 [package]
 name = "astp-tun"
-description = "ASTP-M TUN crate (skeleton)"
+description = "ASTP-M v1 TUN device, packet addressing and Linux network setup"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "process", "sync", "macros", "rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 
 [lints]
 workspace = true
