@@ -26,8 +26,8 @@ Toolchain — Rust 1.89 (MSRV), edition 2021. Это не Rust 1.98 и не edit
 │   ├── probe-common/      общая схема событий, конфигурация, JSONL
 │   ├── probe-client/      CLI astp-probe
 │   ├── probe-server/      сервер диагностики astp-probe-server
-│   ├── probe-analyzer/    разбор журналов (ещё не реализован)
-│   ├── probe-report/      HTML-отчёт (ещё не реализован)
+│   ├── probe-analyzer/    разбор журналов, стыковка клиента и сервера, статистика
+│   ├── probe-report/      текстовый и HTML-отчёт
 │   ├── astp-types/        каркас типов ASTP-M (VPN в разработке, не пробник)
 │   ├── astp-frame/        кодек кадров ASTP-M v1 (не пробник, не транспорт)
 │   ├── astp-crypto/       TLS 1.3 и контракт Authenticator (не пробник, не транспорт)
@@ -55,7 +55,7 @@ Toolchain — Rust 1.89 (MSRV), edition 2021. Это не Rust 1.98 и не edit
 - Конфигурация клиента и сервера, проверка лимитов.
 - Запись и ротация JSONL.
 - Диагностический сервер: TCP/TLS, HTTP/1.1, HTTP/2, QUIC и HTTP/3, echo, download, длительная сессия.
-- CLI пробника: `test`, `status` и `run` (расписание с джиттером, кампания `--campaign 14d`). Команда `report` ещё не выполняет отчёт.
+- CLI пробника: `test`, `status` и `run` (расписание с джиттером, кампания `--campaign 14d`). `report` сводит журналы клиента и сервера в текстовый, JSON- или HTML-отчёт.
 - Каркас крейтов `astp-*`. Бинарники `astp-client` и `astp-server` отказываются: в stderr есть `not implemented`, код выхода 1.
 - Кадры прикладного слоя (спека 0.3 §5) кодирует `astp-frame`. `astp-crypto` задаёт конфиг TLS 1.3 и контракт аутентификатора. Туннель, слушатели QUIC/TCP, handshake сессии и TUN ещё не реализованы.
 
@@ -72,4 +72,4 @@ cargo build --release --workspace
 
 Бинарники каркаса VPN: `astp-client`, `astp-server` (пока `not implemented`).
 
-Дальше по ТЗ пробника: доставка результатов, анализатор, HTML-отчёт и проверка на эталонной Ubuntu 24.04 x86_64.
+Дальше по ТЗ пробника: доставка результатов на административный порт и проверка на эталонной Ubuntu 24.04 x86_64.

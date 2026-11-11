@@ -150,3 +150,63 @@ fn status_counts_rotated_files() {
         "{stdout}"
     );
 }
+
+#[test]
+fn report_summarises_client_and_server_journals() {
+    use probe_common::{ErrorCode, ProbeEvent, Side, TestType, Transport};
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let line = |e: &ProbeEvent| format!("{}\n", serde_json::to_string(e).unwrap());
+    let ok = ProbeEvent::new("t1", "c", "net", "gw", TestType::H2Request, Transport::Tcp).succeed();
+    let bad = ProbeEvent::new("t2", "c", "net", "gw", TestType::H2Request, Transport::Tcp)
+        .fail(ErrorCode::RemoteClosed, "x");
+    std::fs::write(data.join("events.jsonl"), line(&ok) + &line(&bad)).unwrap();
+    let mut srv = ProbeEvent::new(
+        "t2",
+        "s",
+        "server",
+        "s",
+        TestType::H2Request,
+        Transport::Tcp,
+    )
+    .succeed();
+    srv.side = Side::Server;
+    let server_log = dir.path().join("server-events.jsonl");
+    std::fs::write(&server_log, line(&srv)).unwrap();
+    let cfg = dir.path().join("client.toml");
+    std::fs::write(
+        &cfg,
+        format!("[client]\nid = \"c\"\ndata_dir = '{}'\n", data.display()),
+    )
+    .unwrap();
+    let html = dir.path().join("report.html");
+    let output = command()
+        .args(["report", "--last", "1h", "--config"])
+        .arg(&cfg)
+        .arg("--server-log")
+        .arg(&server_log)
+        .arg("--html")
+        .arg(&html)
+        .output()
+        .expect("spawn astp-probe");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("gw h2_request tcp"), "{stdout}");
+    assert!(stdout.contains("50.0%"), "{stdout}");
+    assert!(
+        stdout.contains("client failed, server saw the request"),
+        "{stdout}"
+    );
+    let page = std::fs::read_to_string(&html).unwrap();
+    assert!(page.starts_with("<!doctype html>"));
+
+    let output = command()
+        .args(["report", "--json", "--last", "all", "--log"])
+        .arg(data.join("events.jsonl"))
+        .output()
+        .expect("spawn astp-probe");
+    assert!(output.status.success(), "{output:?}");
+    let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["client_events"], 2);
+}

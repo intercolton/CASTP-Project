@@ -847,6 +847,13 @@ dependencies = [
 [[package]]
 name = "probe-analyzer"
 version = "0.1.0"
+dependencies = [
+ "probe-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+]
 
 [[package]]
 name = "probe-client"
@@ -862,7 +869,9 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "probe-analyzer",
  "probe-common",
+ "probe-report",
  "quinn",
  "rand 0.9.5",
  "rcgen",
@@ -871,6 +880,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "tempfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -895,6 +905,10 @@ dependencies = [
 [[package]]
 name = "probe-report"
 version = "0.1.0"
+dependencies = [
+ "probe-analyzer",
+ "probe-common",
+]
 
 [[package]]
 name = "probe-server"

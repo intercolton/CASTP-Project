@@ -33,15 +33,34 @@ enum Cmd {
         no_long: bool,
     },
     /// Summarise stored results
-    Report {
-        #[arg(long, default_value = "24h")]
-        last: String,
-    },
+    Report(ReportArgs),
     /// Show configuration and stored-result status
     Status {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+}
+
+#[derive(Args)]
+struct ReportArgs {
+    /// Client configuration: its data_dir/events.jsonl is read
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Client journal(s) to read instead of / besides the configured one
+    #[arg(long)]
+    log: Vec<PathBuf>,
+    /// Server journal(s) (server-events.jsonl) to join with the client's
+    #[arg(long)]
+    server_log: Vec<PathBuf>,
+    /// Time window, e.g. 30m, 24h, 14d; "all" for everything
+    #[arg(long, default_value = "24h")]
+    last: String,
+    /// Also write a self-contained HTML report to this file
+    #[arg(long)]
+    html: Option<PathBuf>,
+    /// Print the summary as JSON instead of text
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -128,7 +147,7 @@ fn main() -> Result<()> {
             campaign,
             no_long,
         } => rt.block_on(cmd_run(config, campaign, no_long)),
-        Cmd::Report { .. } => bail!("`report` is not implemented yet — stage D"),
+        Cmd::Report(a) => cmd_report(a),
     }
 }
 
@@ -382,6 +401,48 @@ fn human(ev: &ProbeEvent) -> String {
         s.push_str(&format!("  — {d}"));
     }
     s
+}
+
+fn cmd_report(a: ReportArgs) -> Result<()> {
+    use probe_analyzer::{summarize, Journal};
+    let mut keep = probe_common::config::LogsSection::default().keep_files;
+    let mut client_logs = a.log.clone();
+    if let Some(path) = &a.config {
+        let cfg = ClientConfig::load(path).with_context(|| format!("load {}", path.display()))?;
+        keep = cfg.logs.keep_files;
+        client_logs.push(cfg.client.data_dir.join("events.jsonl"));
+    }
+    if client_logs.is_empty() {
+        bail!("give --config <file> or --log <events.jsonl>");
+    }
+    let mut j = Journal::default();
+    for p in client_logs.iter().chain(&a.server_log) {
+        j.merge(Journal::load(p, keep).with_context(|| format!("read {}", p.display()))?);
+    }
+    let (j, window) = if a.last == "all" {
+        (j, "all events".to_owned())
+    } else {
+        let d = parse_duration(&a.last).map_err(|e| anyhow::anyhow!("--last: {e}"))?;
+        let cutoff = time::OffsetDateTime::now_utc() - d;
+        (j.since(cutoff), format!("last {}", a.last))
+    };
+    let summary = summarize(&j, !a.server_log.is_empty());
+    let meta = probe_report::Meta {
+        title: "ASTP probe report".into(),
+        window,
+        generated_at: probe_common::timefmt::now_rfc3339(),
+    };
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        print!("{}", probe_report::render_text(&summary, &meta));
+    }
+    if let Some(out) = &a.html {
+        std::fs::write(out, probe_report::render_html(&summary, &meta))
+            .with_context(|| format!("write {}", out.display()))?;
+        eprintln!("HTML report written to {}", out.display());
+    }
+    Ok(())
 }
 
 fn cmd_status(config: Option<PathBuf>) -> Result<()> {

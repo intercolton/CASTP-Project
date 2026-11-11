@@ -1,8 +1,16 @@
 [package]
 name = "probe-report"
+description = "ASTP Network Probe: text and HTML reports from analyzer summaries"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+probe-analyzer.workspace = true
+probe-common.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true
