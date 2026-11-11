@@ -10,6 +10,8 @@ use hyper::body::{Body, Frame, SizeHint};
 use probe_common::{ErrorCode, Phase, ProbeEvent};
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::time::Interval;
@@ -33,6 +35,8 @@ pub struct GenBody {
     remaining: u64,
     total: u64,
     chunk: usize,
+    /// Session only: the connection's shared byte budget, drawn per chunk.
+    budget: Option<Arc<AtomicU64>>,
     /// `Some` for a session (heartbeats), `None` for a download.
     interval: Option<Interval>,
     deadline: Instant,
@@ -48,6 +52,7 @@ impl GenBody {
             remaining: bytes,
             total: bytes,
             chunk: CHUNK,
+            budget: None,
             interval: None,
             deadline,
             sent: 0,
@@ -56,20 +61,22 @@ impl GenBody {
         }
     }
 
-    /// `size`-byte heartbeats every `period` until `deadline` or `max_bytes`.
+    /// `size`-byte heartbeats every `period` until `deadline` or until the
+    /// connection's byte `budget` runs out.
     pub fn session(
         size: usize,
         period: std::time::Duration,
         deadline: Instant,
-        max_bytes: u64,
+        budget: Arc<AtomicU64>,
         log: (EventTx, ProbeEvent),
     ) -> Self {
         let mut iv = tokio::time::interval(period);
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         GenBody {
-            remaining: max_bytes,
-            total: max_bytes,
+            remaining: u64::MAX,
+            total: 0,
             chunk: size.clamp(1, CHUNK),
+            budget: Some(budget),
             interval: Some(iv),
             deadline,
             sent: 0,
@@ -114,7 +121,15 @@ impl Body for GenBody {
             self.ended = Some(end);
             return Poll::Ready(None);
         }
-        let n = (self.chunk as u64).min(self.remaining) as usize;
+        let mut n = (self.chunk as u64).min(self.remaining);
+        if let Some(b) = &self.budget {
+            n = crate::handler::take(b, n);
+            if n == 0 {
+                self.ended = Some(Ended::ByteCap);
+                return Poll::Ready(None);
+            }
+        }
+        let n = n as usize;
         self.remaining -= n as u64;
         self.sent += n as u64;
         Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(&FILLER[..n])))))
@@ -161,8 +176,8 @@ impl Drop for GenBody {
             }
             Some(Ended::ByteCap) => {
                 ev.detail = Some(format!(
-                    "ended early: max_session_bytes ({} B) reached",
-                    self.total
+                    "ended early: connection byte budget (max_session_bytes) used up after {} B",
+                    self.sent
                 ));
                 ev.succeed()
             }
@@ -233,7 +248,7 @@ mod tests {
             10,
             Duration::from_millis(1),
             Instant::now() + Duration::from_millis(30),
-            1_000_000,
+            Arc::new(AtomicU64::new(1_000_000)),
             l,
         );
         drain(b).await;
@@ -246,7 +261,7 @@ mod tests {
             10,
             Duration::from_millis(1),
             Instant::now() + Duration::from_secs(60),
-            25,
+            Arc::new(AtomicU64::new(25)),
             l,
         );
         assert_eq!(drain(b).await, 25);

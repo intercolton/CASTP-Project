@@ -624,3 +624,144 @@ async fn silent_connection_is_closed_after_idle_timeout() {
     assert_eq!(idle.error_code, Some(ErrorCode::ApplicationTimeout));
     assert!(idle.duration_ms < 5000, "{idle:?}");
 }
+
+/// Opens TLS + HTTP/2 to the test server and returns a request sender.
+async fn h2_sender(
+    server: &probe_server::Handle,
+    pki: &Pki,
+) -> hyper::client::conn::http2::SendRequest<http_body_util::Empty<bytes::Bytes>> {
+    let tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let tls_cfg =
+        probe_client::tlsutil::client_config(Some(Path::new(&pki.path("ca.pem"))), &[b"h2"], false)
+            .unwrap();
+    let hs = probe_client::tlsutil::handshake(tls_cfg, "probe.test", tcp, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let (sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(hs.stream),
+    )
+    .await
+    .unwrap();
+    tokio::spawn(conn);
+    sender
+}
+
+/// `max_session_bytes` bounds a whole connection, not each request: one
+/// HTTP/2 connection cannot turn the server into a traffic generator by
+/// asking for many downloads.
+#[tokio::test]
+async fn download_budget_is_per_connection() {
+    use http_body_util::BodyExt;
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let mut sender = h2_sender(&server, &pki).await;
+    let get = |bytes: u64| {
+        http::Request::get(format!("https://probe.test/download?bytes={bytes}"))
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap()
+    };
+    // 1 MiB budget in server_cfg: 700 kB, then the 324 kB that is left.
+    let r = sender.send_request(get(700_000)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let n = r.into_body().collect().await.unwrap().to_bytes().len();
+    assert_eq!(n, 700_000);
+    let r = sender.send_request(get(700_000)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let n = r.into_body().collect().await.unwrap().to_bytes().len();
+    assert_eq!(n, 1_048_576 - 700_000);
+    let r = sender.send_request(get(1)).await.unwrap();
+    assert_eq!(r.status(), 429);
+
+    // A new connection has its own budget.
+    let mut fresh = h2_sender(&server, &pki).await;
+    let r = fresh.send_request(get(1000)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    server.shutdown().await.unwrap();
+}
+
+/// Shutting down with a long session open still logs that connection's
+/// `tcp_accept` event instead of aborting its task.
+#[tokio::test]
+async fn shutdown_keeps_events_of_open_connections() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let mut sender = h2_sender(&server, &pki).await;
+    let req =
+        http::Request::get("https://probe.test/session?seconds=30&interval_ms=100&test_id=sd1")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let t = std::time::Instant::now();
+    server.shutdown().await.unwrap();
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    drop(resp);
+
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let accept = sev
+        .iter()
+        .find(|e| e.test_type == TestType::TcpAccept)
+        .unwrap_or_else(|| panic!("tcp_accept lost on shutdown: {sev:#?}"));
+    assert!(
+        accept
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("server shutdown"),
+        "{accept:?}"
+    );
+    assert!(sev.iter().any(|e| e.test_id == "sd1"), "{sev:#?}");
+}
+
+/// A burst of connections over the limit is logged as one counted event,
+/// not one event each.
+#[tokio::test]
+async fn refusals_are_rate_limited() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let mut scfg = server_cfg(&pki, data.path(), 5);
+    scfg.limits.max_connections = 1;
+    let server = probe_server::start(scfg).await.unwrap();
+    let _hold = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..50 {
+        let mut s = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        // The server closes refused connections at once.
+        let mut b = [0u8; 1];
+        let n = tokio::io::AsyncReadExt::read(&mut s, &mut b)
+            .await
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+    }
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let refusals: Vec<_> = sev
+        .iter()
+        .filter(|e| {
+            e.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("connection limit"))
+        })
+        .collect();
+    assert!(
+        (1..=3).contains(&refusals.len()),
+        "expected a few counted events: {refusals:#?}"
+    );
+    let total: u64 = refusals
+        .iter()
+        .map(|e| {
+            let d = e.detail.as_deref().unwrap();
+            let n = d.split(": ").nth(1).unwrap().split(' ').next().unwrap();
+            n.parse::<u64>().unwrap()
+        })
+        .sum();
+    assert_eq!(total, 50, "{refusals:#?}");
+}

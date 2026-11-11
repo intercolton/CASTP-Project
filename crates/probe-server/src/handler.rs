@@ -41,6 +41,20 @@ pub struct Service {
     pub tx: EventTx,
     pub limits: ServerLimitsSection,
     pub requests: Arc<AtomicU64>,
+    /// Bytes this connection may still move through `/download`,
+    /// `/session` and uploads, shared by all its requests: parallel HTTP/2
+    /// streams cannot multiply `max_session_bytes`.
+    pub budget: Arc<AtomicU64>,
+}
+
+/// Takes up to `want` bytes from `budget`; returns how many were granted.
+pub(crate) fn take(budget: &AtomicU64, want: u64) -> u64 {
+    let mut got = 0;
+    let _ = budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+        got = left.min(want);
+        Some(left - got)
+    });
+    got
 }
 
 impl hyper::service::Service<Request<Incoming>> for Service {
@@ -178,9 +192,13 @@ impl Service {
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|e| e.to_string())?;
                 if let Some(data) = frame.data_ref() {
-                    received += data.len() as u64;
+                    let n = data.len() as u64;
+                    received += n;
                     if received > self.limits.max_session_bytes {
                         return Err("upload exceeded max_session_bytes".into());
+                    }
+                    if take(&self.budget, n) < n {
+                        return Err("upload exceeded the connection byte budget".into());
                     }
                 }
             }
@@ -249,7 +267,14 @@ impl Service {
                 let want: u64 = query_param(q, "bytes")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1024 * 1024);
-                let bytes = want.min(self.limits.max_session_bytes);
+                let bytes = take(&self.budget, want.min(self.limits.max_session_bytes));
+                if bytes == 0 && want > 0 {
+                    self.log_other(req, 429);
+                    return text(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "connection byte budget used up\n",
+                    );
+                }
                 let deadline =
                     Instant::now() + Duration::from_secs(self.limits.max_session_seconds);
                 let ev = self.event(req, TestType::Download);
@@ -277,7 +302,7 @@ impl Service {
                     size,
                     Duration::from_millis(interval_ms),
                     Instant::now() + Duration::from_secs(seconds),
-                    self.limits.max_session_bytes,
+                    self.budget.clone(),
                     (self.tx.clone(), ev),
                 );
                 Response::builder()

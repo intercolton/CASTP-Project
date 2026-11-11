@@ -69,8 +69,9 @@ pub async fn start(cfg: ServerConfig) -> Result<Handle> {
     let mut writer = JsonlWriter::open(&log_path, cfg.logs.max_file_bytes, cfg.logs.keep_files)
         .with_context(|| format!("open {}", log_path.display()))?;
     let (tx, mut rx) = mpsc::channel::<ProbeEvent>(4096);
-    let writer_task = tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
+    // File writes block; they run on their own thread, not on a runtime worker.
+    let writer_task = tokio::task::spawn_blocking(move || {
+        while let Some(ev) = rx.blocking_recv() {
             if let Err(e) = writer.write(&ev) {
                 tracing::error!("cannot write event: {e}");
             }
@@ -126,12 +127,20 @@ pub(crate) struct Shared {
     limit: Arc<Semaphore>,
 }
 
+/// Concurrent HTTP/2 streams per connection.
+pub const MAX_H2_STREAMS: u32 = 4;
+
+/// How long open connections get to finish after a shutdown request
+/// before they are cut; their events are logged either way.
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 async fn accept_loop(
     listener: TcpListener,
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut conns = JoinSet::new();
+    let mut refused = Refusals::new(Transport::Tcp);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -146,16 +155,114 @@ async fn accept_loop(
                         continue;
                     }
                 };
+                // Checked before spawning: a flood of refused connections
+                // costs neither a task nor a blocking log write each.
+                let Ok(permit) = shared.limit.clone().try_acquire_owned() else {
+                    drop(stream);
+                    refused.note(&shared, peer);
+                    continue;
+                };
                 let shared = shared.clone();
-                conns.spawn(async move { handle_conn(shared, stream, peer).await });
+                let sd = shutdown.clone();
+                conns.spawn(async move {
+                    let _permit = permit;
+                    handle_conn(shared, stream, peer, sd).await
+                });
             }
         }
     }
-    conns.shutdown().await;
+    refused.flush(&shared);
+    drain(conns).await;
     Ok(())
 }
 
-async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
+/// Waits for connection tasks that are winding down after a shutdown
+/// request, then aborts whatever is still left.
+pub(crate) async fn drain(mut conns: JoinSet<()>) {
+    let wait = async { while conns.join_next().await.is_some() {} };
+    if tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(3), wait)
+        .await
+        .is_err()
+    {
+        tracing::warn!("connections did not finish after shutdown, aborting them");
+    }
+    conns.shutdown().await;
+}
+
+/// Connections turned away by the connection limit. Logged at most once a
+/// second, with the count, so a flood cannot crowd out the journal.
+pub(crate) struct Refusals {
+    transport: Transport,
+    count: u64,
+    since: Instant,
+    last_peer: Option<SocketAddr>,
+}
+
+impl Refusals {
+    pub(crate) fn new(transport: Transport) -> Self {
+        Refusals {
+            transport,
+            count: 0,
+            since: Instant::now(),
+            last_peer: None,
+        }
+    }
+
+    pub(crate) fn note(&mut self, shared: &Shared, peer: SocketAddr) {
+        self.count += 1;
+        self.last_peer = Some(peer);
+        if self.since.elapsed() >= Duration::from_secs(1) {
+            self.flush(shared);
+        }
+    }
+
+    pub(crate) fn flush(&mut self, shared: &Shared) {
+        let Some(peer) = self.last_peer.take() else {
+            return;
+        };
+        let cfg = &shared.cfg;
+        let tt = match self.transport {
+            Transport::Quic => TestType::QuicAccept,
+            _ => TestType::TcpAccept,
+        };
+        let mut ev = ProbeEvent::new(
+            ProbeEvent::new_test_id(),
+            &cfg.server.id,
+            "server",
+            &cfg.server.id,
+            tt,
+            self.transport,
+        );
+        ev.side = Side::Server;
+        ev.peer = Some(peer.to_string());
+        ev.phase = Some(Phase::TcpConnected);
+        if self.transport == Transport::Quic {
+            ev.phase = Some(Phase::FirstBytesReceived);
+        }
+        ev.duration_ms = self.since.elapsed().as_millis() as u64;
+        let ev = ev.fail(
+            ErrorCode::Unknown,
+            format!(
+                "server connection limit ({}) reached: {} connection(s) refused in {:.1} s, last from {peer}",
+                cfg.limits.max_connections,
+                self.count,
+                self.since.elapsed().as_secs_f64()
+            ),
+        );
+        if shared.tx.try_send(ev).is_err() {
+            tracing::warn!("event queue full, dropped a refusal event");
+        }
+        self.count = 0;
+        self.since = Instant::now();
+    }
+}
+
+async fn handle_conn(
+    shared: Arc<Shared>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let start = Instant::now();
     let cfg = &shared.cfg;
     let mut ev = ProbeEvent::new(
@@ -170,31 +277,26 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
     ev.peer = Some(peer.to_string());
     ev.phase = Some(Phase::TcpConnected);
 
-    let Ok(_permit) = shared.limit.clone().try_acquire_owned() else {
-        ev.duration_ms = start.elapsed().as_millis() as u64;
-        let _ = shared
-            .tx
-            .send(ev.fail(
-                ErrorCode::Unknown,
-                "server connection limit reached, closed",
-            ))
-            .await;
-        return;
-    };
-
     let _ = stream.set_nodelay(true);
     let (io, counters) = Counting::new(stream);
     let hs_timeout = Duration::from_secs(cfg.limits.handshake_timeout_seconds);
-    let hs = tokio::time::timeout(hs_timeout, shared.acceptor.accept(io)).await;
+    let hs = tokio::select! {
+        hs = tokio::time::timeout(hs_timeout, shared.acceptor.accept(io)) => Some(hs),
+        _ = shutdown.changed() => None,
+    };
     let tls = match hs {
-        Ok(Ok(tls)) => tls,
+        Some(Ok(Ok(tls))) => tls,
         other => {
             let (code, detail) = match other {
-                Err(_) => (
+                None => (
+                    ErrorCode::RemoteClosed,
+                    "server shut down during the TLS handshake".into(),
+                ),
+                Some(Err(_)) => (
                     ErrorCode::TlsHandshakeFailed,
                     format!("no complete TLS handshake within {}s", hs_timeout.as_secs()),
                 ),
-                Ok(Err(e)) => match e.kind() {
+                Some(Ok(Err(e))) => match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => (
                         ErrorCode::RemoteClosed,
                         "peer closed before TLS finished".into(),
@@ -204,7 +306,7 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
                     }
                     _ => (ErrorCode::TlsHandshakeFailed, e.to_string()),
                 },
-                Ok(Ok(_)) => unreachable!(),
+                Some(Ok(Ok(_))) => unreachable!(),
             };
             if counters.received() > 0 {
                 ev.phase = Some(Phase::FirstBytesReceived);
@@ -238,6 +340,7 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
         tx: shared.tx.clone(),
         limits: cfg.limits.clone(),
         requests: requests.clone(),
+        budget: Arc::new(AtomicU64::new(cfg.limits.max_session_bytes)),
     };
     let timer = hyper_util::rt::TokioTimer::new();
     let idle = Duration::from_secs(cfg.limits.idle_timeout_seconds);
@@ -252,15 +355,25 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
         .timer(timer)
         .keep_alive_interval(Duration::from_secs(30))
         .keep_alive_timeout(Duration::from_secs(20))
+        // Enough for a browser-like client; caps parallel /download streams.
+        .max_concurrent_streams(MAX_H2_STREAMS)
         .adaptive_window(true);
     let conn = builder.serve_connection(TokioIo::new(tls), svc);
-    let max = Duration::from_secs(cfg.limits.max_session_seconds + 30);
+    tokio::pin!(conn);
+    let max = tokio::time::sleep(Duration::from_secs(cfg.limits.max_session_seconds + 30));
+    tokio::pin!(max);
     let outcome = tokio::select! {
-        r = tokio::time::timeout(max, conn) => match r {
-            Ok(r) => End::Closed(r),
-            Err(_) => End::SessionLimit,
-        },
+        r = conn.as_mut() => End::Closed(r),
+        _ = &mut max => End::SessionLimit,
         _ = idle_watch(&counters, idle) => End::Idle,
+        _ = shutdown.changed() => {
+            // GOAWAY / Connection: close; requests in flight get a short grace.
+            conn.as_mut().graceful_shutdown();
+            match tokio::time::timeout(SHUTDOWN_GRACE, conn.as_mut()).await {
+                Ok(r) => End::Closed(r),
+                Err(_) => End::Shutdown,
+            }
+        }
     };
 
     let n = requests.load(Ordering::Relaxed);
@@ -275,6 +388,10 @@ async fn handle_conn(shared: Arc<Shared>, stream: TcpStream, peer: SocketAddr) {
         End::SessionLimit => ev.fail(
             ErrorCode::ApplicationTimeout,
             "connection exceeded the session limit",
+        ),
+        End::Shutdown => ev.fail(
+            ErrorCode::RemoteClosed,
+            format!("{version}, {n} request(s), cut by server shutdown"),
         ),
         // Keeping a served connection open and then going quiet is what
         // browsers do; a peer that never asked for anything is not.
@@ -315,6 +432,7 @@ enum End {
     Closed(std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>),
     SessionLimit,
     Idle,
+    Shutdown,
 }
 
 /// Returns once no byte has moved in either direction for `idle`.
