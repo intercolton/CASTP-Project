@@ -1084,3 +1084,68 @@ async fn scheduler_stops_at_once_on_signal() {
     assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
     server.shutdown().await.unwrap();
 }
+
+/// An HTTP/2 connection that never sends a request is idle even though
+/// the server's keepalive PINGs and the client's ACKs keep bytes moving.
+#[tokio::test]
+async fn idle_h2_connection_is_closed_despite_pings() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let mut scfg = server_cfg(&pki, data.path(), 5);
+    scfg.limits.max_connections = 1;
+    scfg.limits.idle_timeout_seconds = 1;
+    let server = probe_server::start(scfg).await.unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+
+    // Preface and SETTINGS, then nothing but PING/ACK (every 0.5 s here).
+    let sender = h2_sender(&server, &pki).await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let free = collect(
+        &cfg,
+        Selection {
+            h2: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        free[0].success,
+        "slot still held by an idle h2 connection: {:?}",
+        free[0]
+    );
+    drop(sender);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    assert!(
+        sev.iter().any(|e| e.test_type == TestType::TcpAccept
+            && e.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("no request"))),
+        "{sev:#?}"
+    );
+}
+
+/// A request in flight is activity: a session whose heartbeats are
+/// further apart than the idle timeout runs to its end.
+#[tokio::test]
+async fn slow_session_is_not_idle() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let mut scfg = server_cfg(&pki, data.path(), 5);
+    scfg.limits.idle_timeout_seconds = 1;
+    let server = probe_server::start(scfg).await.unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let plan = SessionPlan {
+        seconds: 4,
+        interval_ms: 1500,
+        size: 100,
+        stall_seconds: 4,
+    };
+    let e = stream::long_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert!(e.success, "{e:?}");
+    let e = stream::upload_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert!(e.success, "{e:?}");
+    server.shutdown().await.unwrap();
+}

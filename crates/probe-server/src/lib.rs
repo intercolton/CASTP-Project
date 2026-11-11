@@ -11,7 +11,7 @@ mod tls;
 use anyhow::{Context, Result};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use probe_common::config::ServerConfig;
-use probe_common::counting::{Counters, Counting};
+use probe_common::counting::Counting;
 use probe_common::jsonl::JsonlWriter;
 use probe_common::{ErrorCode, Phase, ProbeEvent, Side, TestType, Transport};
 use std::net::SocketAddr;
@@ -334,12 +334,14 @@ async fn handle_conn(
     }
 
     let requests = Arc::new(AtomicU64::new(0));
+    let in_flight = Arc::new(AtomicU64::new(0));
     let svc = handler::Service {
         server_id: cfg.server.id.clone(),
         peer,
         tx: shared.tx.clone(),
         limits: cfg.limits.clone(),
         requests: requests.clone(),
+        in_flight: in_flight.clone(),
         budget: Arc::new(AtomicU64::new(cfg.limits.max_session_bytes)),
         conn_start: start,
     };
@@ -354,7 +356,8 @@ async fn handle_conn(
     builder
         .http2()
         .timer(timer)
-        .keep_alive_interval(Duration::from_secs(30))
+        // PING finds a dead peer; it does not count as activity (idle_watch).
+        .keep_alive_interval((idle / 2).clamp(Duration::from_millis(500), Duration::from_secs(30)))
         .keep_alive_timeout(Duration::from_secs(20))
         // Enough for a browser-like client; caps parallel /download streams.
         .max_concurrent_streams(MAX_H2_STREAMS)
@@ -366,7 +369,7 @@ async fn handle_conn(
     let outcome = tokio::select! {
         r = conn.as_mut() => End::Closed(r),
         _ = &mut max => End::SessionLimit,
-        _ = idle_watch(&counters, idle) => End::Idle,
+        _ = idle_watch(&requests, &in_flight, idle) => End::Idle,
         _ = shutdown.changed() => {
             // GOAWAY / Connection: close; requests in flight get a short grace.
             conn.as_mut().graceful_shutdown();
@@ -436,19 +439,22 @@ enum End {
     Shutdown,
 }
 
-/// Returns once no byte has moved in either direction for `idle`.
+/// Returns once the connection has had no request in flight and no new
+/// request for `idle`.
 ///
-/// Both directions count: in a split-path cascade an upload leg legitimately
-/// sends almost nothing back and a download leg receives almost nothing, so
-/// "nothing received for N s" would cut healthy one-way connections.
-async fn idle_watch(counters: &Counters, idle: Duration) {
+/// Activity is counted in requests, not bytes: HTTP/2 keepalive PINGs and
+/// their ACKs move bytes on an otherwise unused connection and would keep
+/// it (and its connection slot) forever. A request in flight counts in
+/// either direction, so a one-way leg of a split-path cascade (an upload
+/// that gets almost nothing back, a slow heartbeat session) is not idle.
+async fn idle_watch(requests: &AtomicU64, in_flight: &AtomicU64, idle: Duration) {
     let tick = (idle / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
-    let mut seen = counters.total();
+    let mut seen = requests.load(Ordering::Relaxed);
     let mut since = tokio::time::Instant::now();
     loop {
         tokio::time::sleep(tick).await;
-        let now = counters.total();
-        if now != seen {
+        let now = requests.load(Ordering::Relaxed);
+        if now != seen || in_flight.load(Ordering::Relaxed) > 0 {
             seen = now;
             since = tokio::time::Instant::now();
         } else if since.elapsed() >= idle {

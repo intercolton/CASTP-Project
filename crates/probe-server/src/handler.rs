@@ -50,6 +50,8 @@ pub struct Service {
     pub tx: EventTx,
     pub limits: ServerLimitsSection,
     pub requests: Arc<AtomicU64>,
+    /// Requests whose response is still being sent.
+    pub in_flight: Arc<AtomicU64>,
     /// Bytes this connection may still move through `/download`,
     /// `/session` and uploads, shared by all its requests: parallel HTTP/2
     /// streams cannot multiply `max_session_bytes`.
@@ -126,10 +128,64 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         self.requests.fetch_add(1, Ordering::Relaxed);
-        if req.method() == http::Method::POST && req.uri().path() == SESSION_PATH {
-            return Box::pin(ready(Ok(self.upload_session(req))));
-        }
-        Box::pin(ready(Ok(self.route(&req))))
+        let guard = InFlight::new(self.in_flight.clone());
+        let resp = if req.method() == http::Method::POST && req.uri().path() == SESSION_PATH {
+            self.upload_session(req)
+        } else {
+            self.route(&req)
+        };
+        // The request counts as in flight until its response body is done
+        // or dropped: a long session keeps the connection busy.
+        let resp = resp.map(|inner| {
+            Tracked {
+                inner,
+                _guard: guard,
+            }
+            .boxed_unsync()
+        });
+        Box::pin(ready(Ok(resp)))
+    }
+}
+
+/// One request in flight on a connection; decrements the count on drop.
+struct InFlight(Arc<AtomicU64>);
+
+impl InFlight {
+    fn new(n: Arc<AtomicU64>) -> Self {
+        n.fetch_add(1, Ordering::Relaxed);
+        InFlight(n)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A response body that holds its request's [`InFlight`].
+struct Tracked {
+    inner: RespBody,
+    _guard: InFlight,
+}
+
+impl hyper::body::Body for Tracked {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
