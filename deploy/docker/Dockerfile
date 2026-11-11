@@ -5,7 +5,8 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p probe-server
 
-FROM debian:bookworm-slim
+# Дайджест: multi-arch index debian:bookworm-slim с Docker Hub (2026-11-11).
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN useradd --system --create-home --home-dir /var/lib/astp-probe astp
 COPY --from=build /src/target/release/astp-probe-server /usr/local/bin/astp-probe-server
 USER astp

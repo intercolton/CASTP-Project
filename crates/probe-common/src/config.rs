@@ -206,7 +206,7 @@ impl TargetConfig {
 #[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     pub id: String,
-    /// Full HTTPS URL, e.g. "https://www.wikipedia.org/".
+    /// Full HTTPS URL, e.g. `https://www.wikipedia.org/`.
     pub url: String,
 }
 

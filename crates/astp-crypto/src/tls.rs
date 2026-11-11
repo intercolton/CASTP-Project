@@ -116,7 +116,7 @@ impl AlpnMode {
 
 /// Inputs for [`client_config`].
 ///
-/// [`ClientOptions::server_name`] is the name the handshake must verify.
+/// [`ClientTlsConfig::server_name`] is the name the handshake must verify.
 /// This crate has no connector that skips that check.
 #[derive(Debug)]
 pub struct ClientOptions {
