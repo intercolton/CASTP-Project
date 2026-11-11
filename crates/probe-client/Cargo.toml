@@ -24,6 +24,7 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
 webpki-roots.workspace = true
+h2.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
