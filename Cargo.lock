@@ -166,6 +166,26 @@ dependencies = [
 [[package]]
 name = "astp-transport"
 version = "0.1.0"
+dependencies = [
+ "astp-crypto",
+ "astp-frame",
+ "astp-session",
+ "bytes",
+ "h3",
+ "h3-quinn",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "astp-tun"

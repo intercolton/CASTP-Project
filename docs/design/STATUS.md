@@ -14,6 +14,6 @@
 - [x] проектные документы (этот каталог)
 - [x] `astp-crypto`: боевой формат учётных данных
 - [x] `astp-session`: состояние сессии и обмен кадрами
-- [ ] `astp-transport`: HTTP/2 поверх TLS, HTTP/3 поверх QUIC, сайт-прикрытие
+- [x] `astp-transport`: HTTP/2 поверх TLS, HTTP/3 поверх QUIC, сайт-прикрытие
 - [ ] `astp-tun`: устройство TUN, настройка адресов и маршрутов
 - [ ] `astp-server`, `astp-client`: бинарники, конфигурация, systemd
