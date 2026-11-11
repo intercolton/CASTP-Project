@@ -56,7 +56,7 @@ Toolchain — Rust 1.89 (MSRV), edition 2021. Это не Rust 1.98 и не edit
 - Запись и ротация JSONL.
 - Диагностический сервер: TCP/TLS, HTTP/1.1, HTTP/2, QUIC и HTTP/3, echo, download, длительная сессия.
 - CLI пробника: `test`, `status` и `run` (расписание с джиттером, кампания `--campaign 14d`). `report` сводит журналы клиента и сервера в текстовый, JSON- или HTML-отчёт.
-- VPN ASTP-M v1: кадры (`astp-frame`, спека 0.3 §5), TLS 1.3 и учётные данные с привязкой к каналу (`astp-crypto`), сессия (`astp-session`), транспорт HTTP/2 и HTTP/3 за сайтом-прикрытием (`astp-transport`), TUN (`astp-tun`), бинарники `astp-server` и `astp-client`. Сквозные автотесты идут на localhost без TUN; прогона на двух машинах ещё не было.
+- VPN ASTP-M v1: кадры (`astp-frame`, спека 0.3 §5), TLS 1.3 и учётные данные с привязкой к каналу (`astp-crypto`), сессия (`astp-session`), транспорт HTTP/2 и HTTP/3 за сайтом-прикрытием (`astp-transport`), TUN (`astp-tun`), бинарники `astp-server` и `astp-client`. Сквозные автотесты идут на localhost без TUN; с настоящими TUN связку проверяет `scripts/vpn-netns-smoke.sh` (root).
 
 Неподдерживаемая команда завершается ошибкой. Успех теста не подменяется заглушкой.
 
