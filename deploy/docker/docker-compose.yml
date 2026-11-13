@@ -4,11 +4,15 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     ports:
-      - "443:443/tcp"
-      - "443:443/udp"
+      # 443 остаётся шлюзу ASTP-M.
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
     volumes:
       - ./server.toml:/etc/astp-probe/server.toml:ro
-      - ./certs:/etc/astp-probe/certs:ro
+      # Пути совпадают с [tls] в configs/server.example.toml. Файлы должны
+      # читаться пользователем astp внутри контейнера.
+      - ./certs/cert.pem:/etc/astp-probe/cert.pem:ro
+      - ./certs/key.pem:/etc/astp-probe/key.pem:ro
       - probe-data:/var/lib/astp-probe
     restart: unless-stopped
 

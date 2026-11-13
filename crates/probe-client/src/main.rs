@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use probe_client::schedule::{parse_duration, run_scheduled, Schedule};
 use probe_client::stream::SessionPlan;
 use probe_client::{run_long, run_quick, Selection};
 use probe_common::config::{ClientConfig, ClientSection, TargetConfig};
@@ -24,17 +25,42 @@ enum Cmd {
     Run {
         #[arg(long)]
         config: PathBuf,
+        /// Stop after this long, e.g. 14d (a measurement campaign)
+        #[arg(long)]
+        campaign: Option<String>,
+        /// Quick tests only, no long sessions
+        #[arg(long)]
+        no_long: bool,
     },
     /// Summarise stored results
-    Report {
-        #[arg(long, default_value = "24h")]
-        last: String,
-    },
+    Report(ReportArgs),
     /// Show configuration and stored-result status
     Status {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+}
+
+#[derive(Args)]
+struct ReportArgs {
+    /// Client configuration: its data_dir/events.jsonl is read
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Client journal(s) to read instead of / besides the configured one
+    #[arg(long)]
+    log: Vec<PathBuf>,
+    /// Server journal(s) (server-events.jsonl) to join with the client's
+    #[arg(long)]
+    server_log: Vec<PathBuf>,
+    /// Time window, e.g. 30m, 24h, 14d; "all" for everything
+    #[arg(long, default_value = "24h")]
+    last: String,
+    /// Also write a self-contained HTML report to this file
+    #[arg(long)]
+    html: Option<PathBuf>,
+    /// Print the summary as JSON instead of text
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -48,13 +74,14 @@ struct TestArgs {
     /// Ad-hoc target host (instead of --config)
     #[arg(long, conflicts_with = "config")]
     host: Option<String>,
-    #[arg(long, default_value_t = 443)]
+    /// Port of the ad-hoc target
+    #[arg(long, default_value_t = 443, conflicts_with = "config")]
     port: u16,
     /// TLS server name for ad-hoc targets given as an IP
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     sni: Option<String>,
     /// PEM CA file for ad-hoc targets with a private CA
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     ca_file: Option<PathBuf>,
     /// Bind sockets to this interface (bypass a VPN), e.g. eno1
     #[arg(long)]
@@ -115,8 +142,12 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Test(a) => rt.block_on(cmd_test(*a)),
         Cmd::Status { config } => cmd_status(config),
-        Cmd::Run { .. } => bail!("`run` (scheduled tests) is not implemented yet — stage C"),
-        Cmd::Report { .. } => bail!("`report` is not implemented yet — stage D"),
+        Cmd::Run {
+            config,
+            campaign,
+            no_long,
+        } => rt.block_on(cmd_run(config, campaign, no_long)),
+        Cmd::Report(a) => cmd_report(a),
     }
 }
 
@@ -177,6 +208,7 @@ fn build_config(a: &TestArgs) -> Result<ClientConfig> {
                 enable_quic: true,
                 enable_h3: true,
                 quic_port: a.port,
+                role: Default::default(),
             }],
             controls: vec![],
         };
@@ -199,6 +231,7 @@ fn build_config(a: &TestArgs) -> Result<ClientConfig> {
     if let Some(n) = &a.network {
         cfg.client.network_id = n.clone();
     }
+    check_ca_files(&cfg)?;
     Ok(cfg)
 }
 
@@ -237,6 +270,7 @@ async fn cmd_test(a: TestArgs) -> Result<()> {
             size: a.long_size,
             stall_seconds: a.stall_seconds,
         };
+        plan.check().map_err(|e| anyhow::anyhow!("--long: {e}"))?;
         eprintln!(
             "long session: {} s, {} B every {} ms, freeze after {} s without data",
             plan.seconds, plan.size, plan.interval_ms, plan.stall_seconds
@@ -254,6 +288,86 @@ async fn cmd_test(a: TestArgs) -> Result<()> {
     }
     if failed > 0 {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn cmd_run(path: PathBuf, campaign: Option<String>, no_long: bool) -> Result<()> {
+    let cfg = ClientConfig::load(&path).with_context(|| format!("load {}", path.display()))?;
+    tracing_subscriber::fmt()
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.client.log_level)),
+        )
+        .init();
+    check_ca_files(&cfg)?;
+    let mut sched = Schedule::from_config(&cfg);
+    sched.no_long = no_long;
+    sched.campaign = campaign
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--campaign: {e}"))?;
+    let log = cfg.client.data_dir.join("events.jsonl");
+    let mut writer = JsonlWriter::open(&log, cfg.logs.max_file_bytes, cfg.logs.keep_files)
+        .with_context(|| format!("open {}", log.display()))?;
+    tracing::info!(
+        targets = cfg.targets.len(),
+        quick_s = cfg.schedule.quick_interval_seconds,
+        long_s = cfg.schedule.long_interval_seconds,
+        campaign = ?sched.campaign,
+        log = %log.display(),
+        "scheduled tests started"
+    );
+    let mut write_errors = 0u64;
+    run_scheduled(
+        &cfg,
+        sched,
+        |ev| {
+            tracing::info!("{}", human(&ev));
+            if let Err(e) = writer.write(&ev) {
+                write_errors += 1;
+                tracing::error!("cannot write event: {e}");
+            }
+        },
+        |ran| tracing::debug!(?ran, "pass finished"),
+        shutdown_signal(),
+    )
+    .await;
+    tracing::info!("stopped");
+    if write_errors > 0 {
+        bail!(
+            "{write_errors} event(s) could not be written to {}",
+            log.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+/// A CA file that is missing or empty is a configuration error: say so
+/// once instead of reporting a certificate failure on every probe.
+fn check_ca_files(cfg: &ClientConfig) -> Result<()> {
+    for t in &cfg.targets {
+        if let Some(ca) = t.ca_file.as_deref() {
+            probe_client::tlsutil::root_store(Some(ca))
+                .map_err(|f| anyhow::anyhow!("target {}: {}", t.id, f.detail))?;
+        }
     }
     Ok(())
 }
@@ -287,6 +401,48 @@ fn human(ev: &ProbeEvent) -> String {
         s.push_str(&format!("  — {d}"));
     }
     s
+}
+
+fn cmd_report(a: ReportArgs) -> Result<()> {
+    use probe_analyzer::{summarize, Journal};
+    let mut keep = probe_common::config::LogsSection::default().keep_files;
+    let mut client_logs = a.log.clone();
+    if let Some(path) = &a.config {
+        let cfg = ClientConfig::load(path).with_context(|| format!("load {}", path.display()))?;
+        keep = cfg.logs.keep_files;
+        client_logs.push(cfg.client.data_dir.join("events.jsonl"));
+    }
+    if client_logs.is_empty() {
+        bail!("give --config <file> or --log <events.jsonl>");
+    }
+    let mut j = Journal::default();
+    for p in client_logs.iter().chain(&a.server_log) {
+        j.merge(Journal::load(p, keep).with_context(|| format!("read {}", p.display()))?);
+    }
+    let (j, window) = if a.last == "all" {
+        (j, "all events".to_owned())
+    } else {
+        let d = parse_duration(&a.last).map_err(|e| anyhow::anyhow!("--last: {e}"))?;
+        let cutoff = time::OffsetDateTime::now_utc() - d;
+        (j.since(cutoff), format!("last {}", a.last))
+    };
+    let summary = summarize(&j, !a.server_log.is_empty());
+    let meta = probe_report::Meta {
+        title: "ASTP probe report".into(),
+        window,
+        generated_at: probe_common::timefmt::now_rfc3339(),
+    };
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        print!("{}", probe_report::render_text(&summary, &meta));
+    }
+    if let Some(out) = &a.html {
+        std::fs::write(out, probe_report::render_html(&summary, &meta))
+            .with_context(|| format!("write {}", out.display()))?;
+        eprintln!("HTML report written to {}", out.display());
+    }
+    Ok(())
 }
 
 fn cmd_status(config: Option<PathBuf>) -> Result<()> {
@@ -323,20 +479,30 @@ fn cmd_status(config: Option<PathBuf>) -> Result<()> {
             .join(", ")
     );
     let log = cfg.client.data_dir.join("events.jsonl");
-    match probe_common::jsonl::read_events(&log) {
-        Ok((events, bad)) => {
-            let ok = events.iter().filter(|e| e.success).count();
-            println!(
-                "results:   {} events ({} ok, {} failed), {} unreadable lines in {}",
-                events.len(),
-                ok,
-                events.len() - ok,
-                bad.len(),
-                log.display()
-            );
-        }
-        Err(_) => println!("results:   none yet ({})", log.display()),
+    let files = probe_common::jsonl::rotated_set(&log, cfg.logs.keep_files);
+    if files.is_empty() {
+        println!("results:   none yet ({})", log.display());
+        return Ok(());
     }
+    let (mut total, mut ok, mut bad) = (0usize, 0usize, 0usize);
+    for f in &files {
+        match probe_common::jsonl::read_events(f) {
+            Ok((events, unreadable)) => {
+                total += events.len();
+                ok += events.iter().filter(|e| e.success).count();
+                bad += unreadable.len();
+            }
+            // Rotated away between listing and reading: nothing to count.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => bail!("cannot read {}: {e}", f.display()),
+        }
+    }
+    println!(
+        "results:   {total} events ({ok} ok, {} failed), {bad} unreadable lines in {} file(s) ({}*)",
+        total - ok,
+        files.len(),
+        log.display()
+    );
     Ok(())
 }
 

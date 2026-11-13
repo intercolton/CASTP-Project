@@ -1,0 +1,40 @@
+# Пример сервера ASTP-M v1. Подробности: docs/design/, docs/vpn.md.
+# Секрет клиента и путь сессии: `astp-server keygen`.
+
+[server]
+# TLS + HTTP/2 и QUIC + HTTP/3 на одном номере порта.
+listen_tcp = "0.0.0.0:443"
+listen_quic = "0.0.0.0:443"
+# Секретный путь сессии. Любой другой запрос получает сайт-прикрытие.
+session_path = "/replace-with-keygen-output"
+log_level = "info"
+
+[tls]
+# Публичный сертификат (например, Let's Encrypt); ключ Ed25519 или ECDSA P-256.
+cert_file = "/etc/astp/cert.pem"
+key_file = "/etc/astp/key.pem"
+
+[tunnel]
+device = "astp0"
+address4 = "10.77.0.1/24"
+# address6 = "fd77::1/64"
+mtu = 1400
+dns4 = ["1.1.1.1"]
+# Маршруты клиенту: всё через туннель, кроме локальных сетей.
+routes = ["0.0.0.0/0", "!192.168.0.0/16", "!10.0.0.0/8"]
+keepalive_seconds = 25
+idle_timeout_seconds = 90
+
+# [decoy]
+# index_file = "/etc/astp/site/index.html"
+# not_found_file = "/etc/astp/site/404.html"
+
+[limits]
+max_connections = 1024
+handshake_timeout_seconds = 10
+
+[[clients]]
+name = "laptop"
+# Секрет лучше держать в окружении (EnvironmentFile юнита), не в TOML.
+secret_env = "ASTP_CLIENT_LAPTOP"
+address4 = "10.77.0.2"

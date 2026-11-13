@@ -2,8 +2,8 @@
 //! `quic_accept` event, including those whose handshake never completes;
 //! `/probe` and `/echo` over HTTP/3 are logged with the client's test id.
 
-use crate::handler::{request_event, ECHO_PATH, PROBE_PATH};
-use crate::{tls, Shared};
+use crate::handler::{other_detail, request_event, ECHO_BODY, ECHO_PATH, PROBE_BODY, PROBE_PATH};
+use crate::{drain, tls, Refusals, Shared, SHUTDOWN_GRACE};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::{Response, StatusCode};
@@ -35,23 +35,39 @@ pub async fn accept_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut conns = JoinSet::new();
+    let mut refused = Refusals::new(Transport::Quic);
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
+                let Ok(permit) = shared.limit.clone().try_acquire_owned() else {
+                    let peer = incoming.remote_address();
+                    incoming.refuse();
+                    refused.note(&shared, peer);
+                    continue;
+                };
                 let shared = shared.clone();
-                conns.spawn(async move { handle_conn(shared, incoming).await });
+                let sd = shutdown.clone();
+                conns.spawn(async move {
+                    let _permit = permit;
+                    handle_conn(shared, incoming, sd).await
+                });
             }
         }
     }
+    refused.flush(&shared);
+    drain(conns).await;
     endpoint.close(0u32.into(), b"server shutdown");
-    conns.shutdown().await;
     let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
 }
 
-async fn handle_conn(shared: Arc<Shared>, incoming: quinn::Incoming) {
+async fn handle_conn(
+    shared: Arc<Shared>,
+    incoming: quinn::Incoming,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let start = Instant::now();
     let cfg = &shared.cfg;
     let peer = incoming.remote_address();
@@ -68,35 +84,31 @@ async fn handle_conn(shared: Arc<Shared>, incoming: quinn::Incoming) {
     // An Initial packet arrived: that is the first thing a QUIC server sees.
     ev.phase = Some(Phase::FirstBytesReceived);
 
-    let Ok(_permit) = shared.limit.clone().try_acquire_owned() else {
-        incoming.refuse();
-        let _ = shared
-            .tx
-            .send(ev.fail(
-                ErrorCode::Unknown,
-                "server connection limit reached, refused",
-            ))
-            .await;
-        return;
-    };
-
     let hs_timeout = Duration::from_secs(cfg.limits.handshake_timeout_seconds);
-    let conn = match tokio::time::timeout(hs_timeout, incoming).await {
-        Ok(Ok(c)) => c,
+    let hs = tokio::select! {
+        r = tokio::time::timeout(hs_timeout, incoming) => Some(r),
+        _ = shutdown.changed() => None,
+    };
+    let conn = match hs {
+        Some(Ok(Ok(c))) => c,
         other => {
             let (code, detail) = match other {
-                Err(_) => (
+                None => (
+                    ErrorCode::RemoteClosed,
+                    "server shut down during the QUIC handshake".into(),
+                ),
+                Some(Err(_)) => (
                     ErrorCode::QuicTimeout,
                     format!(
                         "no complete QUIC handshake within {}s",
                         hs_timeout.as_secs()
                     ),
                 ),
-                Ok(Err(quinn::ConnectionError::TimedOut)) => {
+                Some(Ok(Err(quinn::ConnectionError::TimedOut))) => {
                     (ErrorCode::QuicTimeout, "handshake idle timeout".into())
                 }
-                Ok(Err(e)) => (ErrorCode::TlsHandshakeFailed, e.to_string()),
-                Ok(Ok(_)) => unreachable!(),
+                Some(Ok(Err(e))) => (ErrorCode::TlsHandshakeFailed, e.to_string()),
+                Some(Ok(Ok(_))) => unreachable!(),
             };
             ev.duration_ms = start.elapsed().as_millis() as u64;
             let _ = shared.tx.send(ev.fail(code, detail)).await;
@@ -114,7 +126,17 @@ async fn handle_conn(shared: Arc<Shared>, incoming: quinn::Incoming) {
 
     let requests = Arc::new(AtomicU64::new(0));
     let max = Duration::from_secs(cfg.limits.max_session_seconds + 30);
-    let r = tokio::time::timeout(max, serve_h3(&shared, conn.clone(), peer, &requests)).await;
+    let serve = tokio::time::timeout(max, serve_h3(&shared, conn.clone(), peer, &requests, start));
+    tokio::pin!(serve);
+    let r = tokio::select! {
+        r = serve.as_mut() => r.map_err(|_| End::SessionLimit),
+        _ = shutdown.changed() => {
+            match tokio::time::timeout(SHUTDOWN_GRACE, serve.as_mut()).await {
+                Ok(r) => r.map_err(|_| End::SessionLimit),
+                Err(_) => Err(End::Shutdown),
+            }
+        }
+    };
 
     let n = requests.load(Ordering::Relaxed);
     if n > 0 {
@@ -126,11 +148,18 @@ async fn handle_conn(shared: Arc<Shared>, incoming: quinn::Incoming) {
     ev.bytes_received = s.udp_rx.bytes;
     ev.detail = Some(format!("{n} request(s)"));
     let ev = match r {
-        Err(_) => {
+        Err(End::SessionLimit) => {
             conn.close(0u32.into(), b"session limit");
             ev.fail(
                 ErrorCode::ApplicationTimeout,
                 "connection exceeded the session limit",
+            )
+        }
+        Err(End::Shutdown) => {
+            conn.close(0u32.into(), b"server shutdown");
+            ev.fail(
+                ErrorCode::RemoteClosed,
+                format!("{n} request(s), cut by server shutdown"),
             )
         }
         Ok(end) => {
@@ -143,6 +172,11 @@ async fn handle_conn(shared: Arc<Shared>, incoming: quinn::Incoming) {
     let _ = shared.tx.send(ev).await;
 }
 
+enum End {
+    SessionLimit,
+    Shutdown,
+}
+
 /// Serves HTTP/3 until the client goes away. Returns why the connection
 /// ended when that was not a clean close.
 async fn serve_h3(
@@ -150,6 +184,7 @@ async fn serve_h3(
     conn: quinn::Connection,
     peer: SocketAddr,
     requests: &AtomicU64,
+    conn_start: Instant,
 ) -> Option<String> {
     let mut h3 =
         match h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(conn)).await {
@@ -162,6 +197,9 @@ async fn serve_h3(
     let end = loop {
         match h3.accept().await {
             Ok(Some(resolver)) => {
+                // Reap finished streams so a long connection does not keep
+                // one task handle per request it ever served.
+                while streams.try_join_next().is_some() {}
                 requests.fetch_add(1, Ordering::Relaxed);
                 let shared = shared.clone();
                 streams.spawn(async move {
@@ -171,11 +209,13 @@ async fn serve_h3(
                     let started = Instant::now();
                     let (status, body, tt): (_, &'static [u8], _) =
                         match (req.method(), req.uri().path()) {
-                            (&http::Method::GET, PROBE_PATH) => {
-                                (StatusCode::OK, b"ok astp\n", Some(TestType::H3Request))
-                            }
+                            (&http::Method::GET, PROBE_PATH) => (
+                                StatusCode::OK,
+                                PROBE_BODY.as_bytes(),
+                                Some(TestType::H3Request),
+                            ),
                             (&http::Method::GET, ECHO_PATH) => {
-                                (StatusCode::OK, b"echo\n", Some(TestType::Echo))
+                                (StatusCode::OK, ECHO_BODY.as_bytes(), Some(TestType::Echo))
                             }
                             (&http::Method::GET, _) => {
                                 (StatusCode::NOT_FOUND, b"not found\n", None)
@@ -193,25 +233,28 @@ async fn serve_h3(
                         stream.finish().await
                     }
                     .await;
-                    if let Some(tt) = tt {
-                        let mut ev = request_event(
-                            &shared.cfg.server.id,
-                            peer,
-                            &req,
-                            tt,
-                            Transport::Quic,
-                            "h3",
-                        );
-                        ev.duration_ms = started.elapsed().as_millis() as u64;
-                        ev.bytes_sent = body.len() as u64;
-                        ev.phase = Some(Phase::Completed);
-                        let ev = match sent {
-                            Ok(()) => ev.succeed(),
-                            Err(e) => ev.fail(ErrorCode::RemoteClosed, e.to_string()),
-                        };
-                        if shared.tx.try_send(ev).is_err() {
-                            tracing::warn!("event queue full, dropped a request event");
-                        }
+                    let mut ev = request_event(
+                        &shared.cfg.server.id,
+                        peer,
+                        &req,
+                        tt.unwrap_or(TestType::H3Request),
+                        Transport::Quic,
+                        "h3",
+                        conn_start,
+                    );
+                    if tt.is_none() {
+                        // Outside the probe API, logged as over TCP.
+                        ev.detail = Some(other_detail(&req, status.as_u16()));
+                    }
+                    ev.duration_ms = started.elapsed().as_millis() as u64;
+                    ev.bytes_sent = body.len() as u64;
+                    ev.phase = Some(Phase::Completed);
+                    let ev = match sent {
+                        Ok(()) => ev.succeed(),
+                        Err(e) => ev.fail(ErrorCode::RemoteClosed, e.to_string()),
+                    };
+                    if shared.tx.try_send(ev).is_err() {
+                        tracing::warn!("event queue full, dropped a request event");
                     }
                 });
             }

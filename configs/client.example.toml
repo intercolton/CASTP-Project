@@ -33,12 +33,17 @@ keep_files = 8
 [[targets]]
 id = "gateway-01"
 host = "probe.example.net"
-port = 443
+port = 8443
+quic_port = 8443
 enable_tcp = true
 enable_tls = true
 enable_h2 = true
 enable_quic = true
 enable_h3 = true
+
+# Роль в каскаде: uplink (аплоад клиента), downlink (даунлоад), both (по умолчанию).
+# Для пары целей uplink + downlink клиент запускает парную пробу.
+# role = "both"
 
 # Если host — IP, tls_server_name обязателен: проверка сертификата не отключается.
 # tls_server_name = "probe.example.net"

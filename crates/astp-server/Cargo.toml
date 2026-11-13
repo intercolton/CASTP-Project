@@ -1,6 +1,6 @@
 [package]
 name = "astp-server"
-description = "ASTP-M VPN server skeleton (astp-server)"
+description = "ASTP-M VPN server (astp-server)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,7 +15,24 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+astp-crypto.workspace = true
+astp-frame.workspace = true
+astp-session.workspace = true
+astp-transport.workspace = true
+astp-tun.workspace = true
+bytes.workspace = true
 clap.workspace = true
+rand.workspace = true
+rustls.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

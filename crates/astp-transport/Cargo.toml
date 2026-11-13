@@ -1,12 +1,33 @@
 [package]
 name = "astp-transport"
-description = "ASTP-M transport crate (skeleton)"
+description = "ASTP-M v1 transport: sessions inside HTTP/2 over TLS and HTTP/3 over QUIC, behind a decoy site"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+astp-crypto.workspace = true
+bytes.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+astp-frame.workspace = true
+astp-session.workspace = true
+rcgen.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,9 @@
+# Build context for deploy/docker/Dockerfile: sources only.
+.git
+target
+data
+**/data
+*.pem
+*.key
+*.env
+deploy/docker/certs

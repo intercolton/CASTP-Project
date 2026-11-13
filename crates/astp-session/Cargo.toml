@@ -1,12 +1,21 @@
 [package]
 name = "astp-session"
-description = "ASTP-M session crate (skeleton)"
+description = "ASTP-M v1 session: handshake frames, keepalive, flow credit, packet exchange"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+astp-frame.workspace = true
+astp-types.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "time", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time", "test-util"] }
 
 [lints]
 workspace = true

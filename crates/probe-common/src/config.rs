@@ -113,6 +113,26 @@ pub struct LogsSection {
     pub keep_files: usize,
 }
 
+impl LogsSection {
+    /// Most rotated files kept; bounds what rotation renames each time.
+    pub const MAX_KEEP_FILES: usize = 1000;
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_file_bytes < 1024 {
+            return Err(ConfigError::Invalid(
+                "logs.max_file_bytes must be >= 1024".into(),
+            ));
+        }
+        if self.keep_files > Self::MAX_KEEP_FILES {
+            return Err(ConfigError::Invalid(format!(
+                "logs.keep_files must be <= {}",
+                Self::MAX_KEEP_FILES
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Default for LogsSection {
     fn default() -> Self {
         LogsSection {
@@ -130,6 +150,14 @@ pub struct DeliverySection {
     /// Name of the environment variable holding the bearer token.
     #[serde(default = "default_token_env")]
     pub token_env: String,
+    /// PEM file with the trust anchors for the delivery endpoint, when it
+    /// uses a private CA. Unset: the Mozilla root set.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Name to verify the endpoint's certificate against when the URL host
+    /// is an IP literal or differs from the certificate name.
+    #[serde(default)]
+    pub tls_server_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +188,32 @@ pub struct TargetConfig {
     pub enable_h3: bool,
     #[serde(default = "default_quic_port")]
     pub quic_port: u16,
+    /// Which direction this node carries in a split-path cascade.
+    #[serde(default)]
+    pub role: TargetRole,
+}
+
+/// The part a target plays in a split-path cascade: the client's upload
+/// goes to an `uplink` node, its download comes from a `downlink` node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetRole {
+    Uplink,
+    Downlink,
+    /// A single server carrying both directions.
+    #[default]
+    Both,
+}
+
+impl TargetRole {
+    /// Upload tests (client to server) apply to this target.
+    pub fn up(self) -> bool {
+        matches!(self, TargetRole::Uplink | TargetRole::Both)
+    }
+    /// Download tests (server to client) apply to this target.
+    pub fn down(self) -> bool {
+        matches!(self, TargetRole::Downlink | TargetRole::Both)
+    }
 }
 
 impl TargetConfig {
@@ -172,7 +226,7 @@ impl TargetConfig {
 #[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     pub id: String,
-    /// Full HTTPS URL, e.g. "https://www.wikipedia.org/".
+    /// Full HTTPS URL, e.g. `https://www.wikipedia.org/`.
     pub url: String,
 }
 
@@ -270,9 +324,7 @@ impl ClientConfig {
                 return bad(format!("limits.{name} must be within 1..=120"));
             }
         }
-        if self.logs.max_file_bytes < 1024 {
-            return bad("logs.max_file_bytes must be >= 1024".into());
-        }
+        self.logs.validate()?;
         let mut ids = std::collections::HashSet::new();
         for t in &self.targets {
             if !ids.insert(t.id.as_str()) {
@@ -280,6 +332,18 @@ impl ClientConfig {
             }
             if t.host.trim().is_empty() {
                 return bad(format!("target {}: host must not be empty", t.id));
+            }
+            if t.port == 0 || t.quic_port == 0 {
+                return bad(format!(
+                    "target {}: port and quic_port must be 1..=65535",
+                    t.id
+                ));
+            }
+            if t.role != TargetRole::Both && !t.enable_tls {
+                return bad(format!(
+                    "target {}: role {:?} needs enable_tls (directional tests run over TLS + HTTP/2)",
+                    t.id, t.role
+                ));
             }
             if t.host.parse::<std::net::IpAddr>().is_ok() && t.tls_server_name.is_none() {
                 let needs_tls = t.enable_tls || t.enable_h2 || t.enable_quic || t.enable_h3;
@@ -295,13 +359,13 @@ impl ClientConfig {
             if !ids.insert(c.id.as_str()) {
                 return bad(format!("duplicate id {}", c.id));
             }
-            if !c.url.starts_with("https://") {
-                return bad(format!("control {}: url must be https://", c.id));
+            if let Err(e) = check_https_url(&c.url) {
+                return bad(format!("control {}: {e}", c.id));
             }
         }
         if let Some(d) = &self.delivery {
-            if !d.url.starts_with("https://") {
-                return bad("delivery.url must be https://".into());
+            if let Err(e) = check_https_url(&d.url) {
+                return bad(format!("delivery.url: {e}"));
             }
         }
         Ok(())
@@ -434,21 +498,29 @@ impl ServerConfig {
             }
         }
         if let Some(a) = &self.admin {
-            if a.listen.parse::<std::net::SocketAddr>().is_err() {
+            let Ok(admin) = a.listen.parse::<std::net::SocketAddr>() else {
                 return bad(format!("admin.listen is not ip:port: {}", a.listen));
+            };
+            let server: std::net::SocketAddr = self.server.listen.parse().expect("checked above");
+            if overlaps(admin, server) {
+                return bad(format!(
+                    "admin.listen {admin} overlaps server.listen {server}: use another port"
+                ));
             }
-            if a.listen == self.server.listen {
-                return bad("admin.listen must differ from server.listen".into());
-            }
-            if let Some(q) = &self.quic.listen {
-                if a.listen == *q {
-                    return bad("admin.listen must differ from quic.listen".into());
+            if let Some(q) = self.quic.listen.as_deref().and_then(|q| q.parse().ok()) {
+                if overlaps(admin, q) {
+                    return bad(format!(
+                        "admin.listen {admin} overlaps quic.listen {q}: use another port"
+                    ));
                 }
             }
         }
         let l = &self.limits;
-        if l.max_connections == 0 {
-            return bad("limits.max_connections must be > 0".into());
+        if !(1..=Self::MAX_CONNECTIONS).contains(&l.max_connections) {
+            return bad(format!(
+                "limits.max_connections must be within 1..={}",
+                Self::MAX_CONNECTIONS
+            ));
         }
         if !(60..=3600).contains(&l.max_session_seconds) {
             return bad("limits.max_session_seconds must be within 60..=3600".into());
@@ -459,8 +531,65 @@ impl ServerConfig {
         {
             return bad("limits must be > 0".into());
         }
+        self.logs.validate()?;
         Ok(())
     }
+
+    /// Upper bound for `limits.max_connections` (a tokio semaphore takes
+    /// far more, but no single probe server needs it).
+    pub const MAX_CONNECTIONS: usize = 65_536;
+}
+
+/// Two listen addresses on the same port collide when the IPs are equal
+/// or either is a wildcard (`0.0.0.0` or `[::]`; on Linux `[::]` also
+/// takes IPv4 by default).
+fn overlaps(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
+    a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// Checks that `url` is `https://host[:port][/path]` with a non-empty host
+/// and, if given, a port in 1..=65535. No user info.
+pub fn check_https_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("{url} is not an https:// URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return Err(format!("{url}: user info is not allowed"));
+    }
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (ip, after) = v6
+            .split_once(']')
+            .ok_or_else(|| format!("{url}: unclosed [ in host"))?;
+        if ip.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!("{url}: {ip} is not an IPv6 address"));
+        }
+        match after {
+            "" => (ip, None),
+            p => (
+                ip,
+                Some(
+                    p.strip_prefix(':')
+                        .ok_or_else(|| format!("{url}: junk after ]"))?,
+                ),
+            ),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("{url}: no host"));
+    }
+    if let Some(p) = port {
+        match p.parse::<u16>() {
+            Ok(n) if n > 0 => {}
+            _ => return Err(format!("{url}: port {p:?} is not 1..=65535")),
+        }
+    }
+    Ok(())
 }
 
 fn parse_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
@@ -614,6 +743,133 @@ listen = "127.0.0.1:9443"
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         ClientConfig::load(&root.join("configs/client.example.toml")).unwrap();
         ServerConfig::load(&root.join("configs/server.example.toml")).unwrap();
+    }
+
+    /// Every commented-out `key = value` line and `[section]` header in the
+    /// client example is a real option: uncommented, the file must still
+    /// parse and validate.
+    #[test]
+    fn client_example_with_commented_options_enabled() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("configs/client.example.toml")).unwrap();
+        let mut enabled = 0;
+        let uncommented: String = text
+            .lines()
+            .map(|l| {
+                let Some(rest) = l.strip_prefix("# ") else {
+                    return l.to_owned();
+                };
+                let is_header = rest.starts_with('[') && rest.ends_with(']');
+                let is_key = rest
+                    .split_once(" = ")
+                    .is_some_and(|(k, _)| k.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+                if is_header || is_key {
+                    enabled += 1;
+                    rest.to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(enabled >= 5, "expected commented options, found {enabled}");
+        let c = ClientConfig::from_toml(&uncommented).unwrap();
+        let d = c.delivery.expect("[delivery] enabled");
+        assert_eq!(d.tls_server_name.as_deref(), Some("probe.example.net"));
+        assert!(d.ca_file.is_some());
+    }
+
+    #[test]
+    fn target_role_defaults_to_both() {
+        let t = "[client]\nid=\"x\"\n[[targets]]\nid=\"a\"\nhost=\"h\"\n[[targets]]\nid=\"b\"\nhost=\"h\"\nrole=\"uplink\"\n";
+        let c = ClientConfig::from_toml(t).unwrap();
+        assert_eq!(c.targets[0].role, TargetRole::Both);
+        assert_eq!(c.targets[1].role, TargetRole::Uplink);
+        assert!(c.targets[1].role.up() && !c.targets[1].role.down());
+        let bad = format!("{t}enable_tls=false\n");
+        assert!(ClientConfig::from_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn server_rejects_admin_overlapping_a_wildcard() {
+        for (server, admin) in [
+            ("0.0.0.0:443", "[::]:443"),
+            ("[::]:443", "127.0.0.1:443"),
+            ("0.0.0.0:443", "127.0.0.1:443"),
+            ("127.0.0.1:443", "127.0.0.1:443"),
+        ] {
+            let t = SERVER
+                .replacen("0.0.0.0:443", server, 1)
+                .replace("127.0.0.1:9443", admin);
+            assert!(
+                matches!(ServerConfig::from_toml(&t), Err(ConfigError::Invalid(_))),
+                "{server} vs {admin}"
+            );
+        }
+        // Different addresses on the same port, neither a wildcard: fine.
+        let t = SERVER
+            .replacen("0.0.0.0:443", "192.0.2.1:443", 1)
+            .replacen("0.0.0.0:443", "192.0.2.1:443", 1)
+            .replace("127.0.0.1:9443", "127.0.0.1:443");
+        ServerConfig::from_toml(&t).unwrap();
+    }
+
+    #[test]
+    fn server_bounds_connections_and_logs() {
+        for extra in [
+            "[limits]\nmax_connections = 70000\nmax_session_seconds = 60\nmax_session_bytes = 1\nidle_timeout_seconds = 1\nhandshake_timeout_seconds = 1\n",
+            "[logs]\nmax_file_bytes = 100\nkeep_files = 1\n",
+            "[logs]\nmax_file_bytes = 4096\nkeep_files = 5000\n",
+        ] {
+            let t = format!("{SERVER}{extra}");
+            assert!(
+                matches!(ServerConfig::from_toml(&t), Err(ConfigError::Invalid(_))),
+                "{extra}"
+            );
+        }
+        let t = "[client]\nid=\"x\"\n[logs]\nmax_file_bytes = 4096\nkeep_files = 5000\n";
+        assert!(ClientConfig::from_toml(t).is_err());
+    }
+
+    #[test]
+    fn https_urls_are_parsed() {
+        for ok in [
+            "https://www.wikipedia.org/",
+            "https://example.net",
+            "https://example.net:8443/x?y#z",
+            "https://[2001:db8::1]/",
+            "https://[2001:db8::1]:443",
+            "https://192.0.2.1:9443/v1/events",
+        ] {
+            check_https_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "http://example.net/",
+            "https://",
+            "https:///path",
+            "https://example.net:0/",
+            "https://example.net:99999/",
+            "https://example.net:x/",
+            "https://user@example.net/",
+            "https://[2001:db8::1/",
+            "https://[nope]/",
+        ] {
+            assert!(check_https_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn target_port_zero_is_rejected() {
+        let t = "[client]\nid=\"x\"\n[[targets]]\nid=\"a\"\nhost=\"h\"\nport=0\n";
+        assert!(matches!(
+            ClientConfig::from_toml(t),
+            Err(ConfigError::Invalid(_))
+        ));
+        let t = "[client]\nid=\"x\"\n[[targets]]\nid=\"a\"\nhost=\"h\"\nquic_port=0\n";
+        assert!(matches!(
+            ClientConfig::from_toml(t),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

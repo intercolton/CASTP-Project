@@ -22,6 +22,10 @@ impl Counters {
     pub fn received(&self) -> u64 {
         self.received.load(Ordering::Relaxed)
     }
+    /// Bytes in both directions; changes whenever anything crosses the socket.
+    pub fn total(&self) -> u64 {
+        self.sent().wrapping_add(self.received())
+    }
 }
 
 /// Wraps a stream and counts raw bytes read and written (TLS overhead included).

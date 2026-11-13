@@ -27,6 +27,13 @@ pub const CHANNEL_BINDING_LEN: usize = 32;
 pub struct ChannelBinding([u8; CHANNEL_BINDING_LEN]);
 
 impl ChannelBinding {
+    /// Wraps exporter output computed elsewhere, e.g. by a QUIC stack with
+    /// [`CHANNEL_BINDING_LABEL`], [`CHANNEL_BINDING_LEN`] bytes and an empty
+    /// context. TLS-over-TCP callers use [`channel_binding`] instead.
+    pub fn from_exporter(bytes: [u8; CHANNEL_BINDING_LEN]) -> Self {
+        Self(bytes)
+    }
+
     /// Raw exporter output.
     pub fn as_bytes(&self) -> &[u8; CHANNEL_BINDING_LEN] {
         &self.0

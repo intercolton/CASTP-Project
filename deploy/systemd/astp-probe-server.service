@@ -2,6 +2,8 @@
 Description=ASTP Network Probe diagnostic server
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,10 +11,23 @@ ExecStart=/usr/local/bin/astp-probe-server --config /etc/astp-probe/server.toml
 EnvironmentFile=-/etc/astp-probe/server.env
 Restart=on-failure
 RestartSec=3
+
+# Unprivileged transient user; /var/lib/astp-probe is created and owned by it.
+DynamicUser=yes
+StateDirectory=astp-probe
+# The example listens on 8443, which needs no capability. For a port
+# below 1024 add AmbientCapabilities= and CapabilityBoundingSet= with
+# CAP_NET_BIND_SERVICE (see README.md).
+CapabilityBoundingSet=
+# The certificate and key stay root-only in /etc/astp-probe; systemd copies
+# them to /run/credentials/astp-probe-server.service/, readable by the
+# service user only. server.toml must point there (see README.md).
+LoadCredential=cert.pem:/etc/astp-probe/cert.pem
+LoadCredential=key.pem:/etc/astp-probe/key.pem
+
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/astp-probe
 PrivateTmp=true
 
 [Install]

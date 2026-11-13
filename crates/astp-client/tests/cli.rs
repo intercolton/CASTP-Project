@@ -10,27 +10,51 @@ fn command() -> Command {
 }
 
 #[test]
-fn no_args_exits_1_with_not_implemented() {
-    let output = command().output().expect("spawn astp-client");
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "status was {:?}",
-        output.status
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not implemented"), "stderr was {stderr:?}");
+fn missing_config_exits_1() {
+    let output = command()
+        .args(["--config", "/nonexistent/client.toml"])
+        .output()
+        .expect("spawn astp-client");
+    assert_eq!(output.status.code(), Some(1), "{:?}", output.status);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("client.toml"));
 }
 
 #[test]
 fn help_exits_0() {
     for flag in ["--help", "-h"] {
         let output = command().arg(flag).output().expect("spawn astp-client");
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "{flag} status was {:?}",
-            output.status
-        );
+        assert_eq!(output.status.code(), Some(0), "{flag}");
     }
+}
+
+#[test]
+fn check_validates_the_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("client.toml");
+    let write = |secret: &str| {
+        std::fs::write(
+            &cfg,
+            format!(
+                "[client]\nserver = \"vpn.example.net:443\"\nsession_path = \"/abcdefghijklmnop\"\nsecret = \"{secret}\"\n"
+            ),
+        )
+        .unwrap();
+    };
+    let (good, _) = astp_server::keygen().unwrap();
+    write(&good);
+    let ok = command()
+        .arg("--check")
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(ok.status.success(), "{ok:?}");
+    write("not-a-secret");
+    let bad = command()
+        .arg("--check")
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(1));
 }

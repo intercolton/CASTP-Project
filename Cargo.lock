@@ -111,7 +111,22 @@ name = "astp-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astp-crypto",
+ "astp-frame",
+ "astp-server",
+ "astp-session",
+ "astp-transport",
+ "astp-tun",
  "clap",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -119,6 +134,7 @@ name = "astp-crypto"
 version = "0.1.0"
 dependencies = [
  "astp-types",
+ "data-encoding",
  "rcgen",
  "ring",
  "rustls",
@@ -147,20 +163,69 @@ name = "astp-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "astp-crypto",
+ "astp-frame",
+ "astp-session",
+ "astp-transport",
+ "astp-tun",
+ "bytes",
  "clap",
+ "rand 0.9.5",
+ "rustls",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "astp-session"
 version = "0.1.0"
+dependencies = [
+ "astp-frame",
+ "astp-types",
+ "rand 0.9.5",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "astp-transport"
 version = "0.1.0"
+dependencies = [
+ "astp-crypto",
+ "astp-frame",
+ "astp-session",
+ "bytes",
+ "h3",
+ "h3-quinn",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "astp-tun"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "astp-types"
@@ -847,6 +912,13 @@ dependencies = [
 [[package]]
 name = "probe-analyzer"
 version = "0.1.0"
+dependencies = [
+ "probe-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+]
 
 [[package]]
 name = "probe-client"
@@ -855,20 +927,25 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "h2",
  "h3",
  "h3-quinn",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "probe-analyzer",
  "probe-common",
+ "probe-report",
  "quinn",
+ "rand 0.9.5",
  "rcgen",
  "rustls",
  "rustls-pki-types",
  "serde_json",
  "socket2",
  "tempfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -893,6 +970,10 @@ dependencies = [
 [[package]]
 name = "probe-report"
 version = "0.1.0"
+dependencies = [
+ "probe-analyzer",
+ "probe-common",
+]
 
 [[package]]
 name = "probe-server"
@@ -901,6 +982,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "h2",
  "h3",
  "h3-quinn",
  "http",

@@ -13,9 +13,8 @@ astp-types.workspace = true
 bytes.workspace = true
 rand.workspace = true
 thiserror.workspace = true
-# The codec uses AsyncRead (io-util). macros/rt are for tests and doctests.
-# The workspace pin already enables this set; restating it records the need.
-tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+# The codec uses AsyncRead (io-util) and nothing else from tokio.
+tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
 # Integration tests name tokio directly (`#[tokio::test]`, `AsyncRead`).

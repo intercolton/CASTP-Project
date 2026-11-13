@@ -14,6 +14,7 @@ use tokio::net::TcpStream;
 /// Path on the probe server that answers short requests and logs the test id.
 pub const PROBE_PATH: &str = "/probe";
 pub const TEST_ID_HEADER: &str = "x-astp-test-id";
+pub const PAIR_ID_HEADER: &str = "x-astp-pair-id";
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -21,6 +22,9 @@ pub struct Ctx {
     pub network_id: String,
     pub iface: Option<String>,
     pub limits: LimitsSection,
+    /// Set while the two halves of a paired cascade probe run: written into
+    /// both events and sent to both servers.
+    pub pair_id: Option<String>,
 }
 
 impl Ctx {
@@ -40,6 +44,48 @@ pub(crate) struct Attempt {
     pub(crate) ev: ProbeEvent,
     start: Instant,
     counters: Option<Counters>,
+    /// Which resolved address was used, when DNS gave more than one.
+    addr_note: Option<String>,
+}
+
+/// At most this many resolved addresses are tried, one after another.
+pub(crate) const MAX_ADDRS: usize = 4;
+
+/// Tries `addrs` in order until `connect` succeeds. Returns the result and,
+/// when there was a choice, a note naming the address used and what
+/// happened to the ones before it.
+pub(crate) async fn first_working<T, F, Fut>(
+    addrs: &[std::net::SocketAddr],
+    mut connect: F,
+) -> (Result<(std::net::SocketAddr, T), Failure>, Option<String>)
+where
+    F: FnMut(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<T, Failure>>,
+{
+    let addrs = &addrs[..addrs.len().min(MAX_ADDRS)];
+    let mut tried = Vec::new();
+    let mut last = None;
+    for &addr in addrs {
+        match connect(addr).await {
+            Ok(v) => {
+                let note = (addrs.len() > 1).then(|| {
+                    if tried.is_empty() {
+                        format!("addr {addr} (1st of {})", addrs.len())
+                    } else {
+                        format!("addr {addr} after {}", tried.join(", "))
+                    }
+                });
+                return (Ok((addr, v)), note);
+            }
+            Err(f) => {
+                tried.push(format!("{addr}: {}", f.code));
+                last = Some(f);
+            }
+        }
+    }
+    let note = (addrs.len() > 1).then(|| format!("tried {}", tried.join(", ")));
+    let f = last.unwrap_or_else(|| Failure::new(ErrorCode::DnsFailure, "no address to try"));
+    (Err(f), note)
 }
 
 impl Attempt {
@@ -58,16 +104,22 @@ impl Attempt {
             transport,
         );
         ev.interface = ctx.iface.clone();
+        ev.pair_id = ctx.pair_id.clone();
         ev.phase = Some(Phase::None);
         Attempt {
             ev,
             start: Instant::now(),
             counters: None,
+            addr_note: None,
         }
     }
 
     fn elapsed_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
+    }
+
+    pub(crate) fn set_addr_note(&mut self, note: Option<String>) {
+        self.addr_note = note;
     }
 
     pub(crate) fn reached(&mut self, phase: Phase) {
@@ -80,12 +132,21 @@ impl Attempt {
             self.ev.bytes_sent = c.sent();
             self.ev.bytes_received = c.received();
         }
+        let note = self.addr_note.take();
+        let with_note = |d: Option<String>| match (d, &note) {
+            (Some(d), Some(n)) => Some(format!("{d}; {n}")),
+            (d, None) => d,
+            (None, Some(n)) => Some(n.clone()),
+        };
         match result {
             Ok(detail) => {
-                self.ev.detail = detail;
+                self.ev.detail = with_note(detail);
                 self.ev.succeed()
             }
-            Err(f) => self.ev.fail(f.code, f.detail),
+            Err(f) => {
+                let detail = with_note(Some(f.detail)).unwrap_or_default();
+                self.ev.fail(f.code, detail)
+            }
         }
     }
 
@@ -98,9 +159,15 @@ impl Attempt {
     ) -> Result<Counting<TcpStream>, Failure> {
         let addrs = netutil::resolve(host, port, ctx.connect_timeout()).await?;
         self.reached(Phase::DnsResolved);
-        let t = Instant::now();
-        let stream =
-            netutil::connect(addrs[0], ctx.iface.as_deref(), ctx.connect_timeout()).await?;
+        let mut t = Instant::now();
+        let (r, note) = first_working(&addrs, |addr| {
+            t = Instant::now();
+            netutil::connect(addr, ctx.iface.as_deref(), ctx.connect_timeout())
+        })
+        .await;
+        self.addr_note = note;
+        let (_, stream) = r?;
+        // Latency of the connect that worked, not of the ones before it.
         self.ev.connect_ms = Some(t.elapsed().as_millis() as u64);
         self.reached(Phase::TcpConnected);
         let (counting, counters) = Counting::new(stream);
@@ -116,6 +183,19 @@ pub async fn dns(ctx: &Ctx, t: &TargetConfig) -> ProbeEvent {
         a.reached(Phase::DnsResolved);
         Some(format!("{} address(es)", addrs.len()))
     });
+    // getaddrinfo cannot be bound to a device: with a VPN up the query may
+    // go through the tunnel while every other test bypasses it.
+    let r = match (&ctx.iface, r) {
+        (Some(dev), Ok(d)) => Ok(Some(format!(
+            "{}; system resolver, not bound to {dev}",
+            d.unwrap_or_default()
+        ))),
+        (Some(dev), Err(f)) => Err(Failure::new(
+            f.code,
+            format!("{}; system resolver, not bound to {dev}", f.detail),
+        )),
+        (None, r) => r,
+    };
     a.finish(r)
 }
 
@@ -193,9 +273,12 @@ pub async fn control(ctx: &Ctx, c: &ControlConfig) -> ProbeEvent {
             .url
             .parse()
             .map_err(|e| Failure::new(ErrorCode::Unknown, format!("bad control url: {e}")))?;
+        // `Uri::host` keeps the brackets of an IPv6 literal ("[::1]").
         let host = uri
             .host()
             .ok_or_else(|| Failure::new(ErrorCode::Unknown, "control url has no host"))?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .to_owned();
         let port = uri.port_u16().unwrap_or(443);
         let path = uri
@@ -237,11 +320,7 @@ async fn http_exchange(
     }
 
     // Host/:authority carries the verified TLS name, not a raw IP.
-    let authority = if port == 443 {
-        server_name.to_owned()
-    } else {
-        format!("{server_name}:{port}")
-    };
+    let authority = authority(server_name, port);
     let test_id = a.ev.test_id.clone();
     let deadline = ctx.request_timeout();
     let max_bytes = ctx.limits.max_test_bytes as usize;
@@ -308,42 +387,231 @@ async fn http_exchange(
     )))
 }
 
+/// `host[:port]` for Host/:authority; an IPv6 literal gets its brackets back.
+pub(crate) fn authority(host: &str, port: u16) -> String {
+    let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 pub(crate) fn http_failure(e: hyper::Error) -> Failure {
     use std::error::Error as _;
     // The useful part is usually deep in the chain (h2 or I/O), so the
-    // detail carries the whole chain.
+    // detail carries the whole chain; the code comes from the first typed
+    // error in it that says something definite.
     let mut detail = e.to_string();
-    let mut io_code = None;
+    let mut typed = None;
     let mut src = e.source();
     while let Some(s) = src {
         detail.push_str(": ");
         detail.push_str(&s.to_string());
-        if let Some(io) = s.downcast_ref::<std::io::Error>() {
-            io_code.get_or_insert(ErrorCode::from_stream_error(io));
+        if typed.is_none() {
+            typed = typed_code(s);
         }
         src = s.source();
     }
+    let code = typed
+        .or_else(|| {
+            if e.is_timeout() {
+                Some(ErrorCode::ApplicationTimeout)
+            } else if e.is_closed() || e.is_incomplete_message() {
+                Some(ErrorCode::RemoteClosed)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| text_code(&detail));
+    Failure::new(code, detail)
+}
+
+/// Classifies one error of a hyper error chain by its type.
+fn typed_code(s: &(dyn std::error::Error + 'static)) -> Option<ErrorCode> {
+    let known = |c| (c != ErrorCode::Unknown).then_some(c);
+    if let Some(h2e) = s.downcast_ref::<h2::Error>() {
+        // h2 keeps the transport error to itself; it is not in the chain.
+        if let Some(io) = h2e.get_io() {
+            return known(ErrorCode::from_stream_error(io));
+        }
+        if h2e.is_go_away() || h2e.is_reset() {
+            return Some(if h2e.is_remote() {
+                // The peer sent GOAWAY or RST_STREAM: it ended the exchange.
+                ErrorCode::RemoteClosed
+            } else {
+                // Our own h2 stack gave up on what the peer sent.
+                ErrorCode::HttpProtocolError
+            });
+        }
+        // A protocol error h2 detected in what the peer sent.
+        return h2e.reason().map(|_| ErrorCode::HttpProtocolError);
+    }
+    if let Some(io) = s.downcast_ref::<std::io::Error>() {
+        return known(ErrorCode::from_stream_error(io));
+    }
+    None
+}
+
+/// Last resort for errors that reach us only as text. Each pattern is
+/// pinned by a test so a wording change in a dependency shows up there.
+fn text_code(detail: &str) -> ErrorCode {
     let lower = detail.to_lowercase();
-    let code = if let Some(c) = io_code {
-        c
-    } else if e.is_closed() || e.is_incomplete_message() {
-        ErrorCode::RemoteClosed
-    } else if e.is_timeout() {
-        ErrorCode::ApplicationTimeout
-    } else if lower.contains("connection reset") {
+    if lower.contains("connection reset") {
         ErrorCode::TcpReset
     } else if lower.contains("unexpected end of file")
-        // TCP FIN without TLS close_notify: the connection was torn down
-        // under the TLS layer (h2 hides the underlying io::Error).
+        // TCP FIN without TLS close_notify: torn down under the TLS layer.
         || lower.contains("close_notify")
         || lower.contains("connection closed")
         || lower.contains("broken pipe")
-        || lower.contains("go_away")
-        || lower.contains("goaway")
     {
         ErrorCode::RemoteClosed
     } else {
         ErrorCode::HttpProtocolError
-    };
-    Failure::new(code, detail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    #[tokio::test]
+    async fn falls_back_to_the_next_address() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        let t = std::time::Duration::from_secs(5);
+
+        let (r, note) =
+            first_working(&[dead_addr, live_addr], |a| netutil::connect(a, None, t)).await;
+        assert_eq!(r.unwrap().0, live_addr);
+        let note = note.unwrap();
+        assert!(
+            note.contains(&format!("addr {live_addr} after {dead_addr}: tcp_refused")),
+            "{note}"
+        );
+
+        let (r, note) =
+            first_working(&[dead_addr, dead_addr], |a| netutil::connect(a, None, t)).await;
+        assert_eq!(r.unwrap_err().code, ErrorCode::TcpRefused);
+        assert!(note.unwrap().starts_with("tried "));
+
+        // A single address adds no note: details stay as they were.
+        let (r, note) = first_working(&[live_addr], |a| netutil::connect(a, None, t)).await;
+        assert!(r.is_ok());
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn authority_brackets_ipv6() {
+        assert_eq!(authority("probe.test", 443), "probe.test");
+        assert_eq!(authority("probe.test", 8443), "probe.test:8443");
+        assert_eq!(authority("::1", 443), "[::1]");
+        assert_eq!(authority("::1", 8443), "[::1]:8443");
+        assert_eq!(authority("192.0.2.1", 8443), "192.0.2.1:8443");
+    }
+
+    #[test]
+    fn typed_errors_are_classified() {
+        // The peer sent something h2 rejects.
+        let proto = h2::Error::from(h2::Reason::PROTOCOL_ERROR);
+        assert_eq!(typed_code(&proto), Some(ErrorCode::HttpProtocolError));
+        let reset = io::Error::new(io::ErrorKind::ConnectionReset, "x");
+        assert_eq!(typed_code(&reset), Some(ErrorCode::TcpReset));
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "x");
+        assert_eq!(typed_code(&eof), Some(ErrorCode::RemoteClosed));
+        // An I/O error that says nothing definite falls through to the text.
+        assert_eq!(typed_code(&io::Error::other("x")), None);
+    }
+
+    /// Wording the text fallback depends on. rustls: a TCP FIN without
+    /// close_notify; std: the reset and EOF messages.
+    #[test]
+    fn text_fallback_patterns() {
+        let eof = io::Error::from(io::ErrorKind::UnexpectedEof).to_string();
+        assert_eq!(text_code(&eof), ErrorCode::RemoteClosed, "{eof}");
+        let reset = io::Error::from_raw_os_error(libc_econnreset()).to_string();
+        assert_eq!(text_code(&reset), ErrorCode::TcpReset, "{reset}");
+        let tls = rustls_eof_without_close_notify();
+        assert_eq!(tls.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            text_code(&tls.to_string()),
+            ErrorCode::RemoteClosed,
+            "{tls}"
+        );
+        assert_eq!(
+            text_code("frame with invalid size"),
+            ErrorCode::HttpProtocolError
+        );
+    }
+
+    /// The error rustls gives when TCP closes under an established TLS
+    /// session without close_notify, produced in memory.
+    fn rustls_eof_without_close_notify() -> io::Error {
+        use std::io::Read;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["probe.test".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let der = cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der.clone()).unwrap();
+        let provider = crate::tlsutil::provider();
+        let server_cfg = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![der],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            std::sync::Arc::new(client_cfg),
+            "probe.test".try_into().unwrap(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(std::sync::Arc::new(server_cfg)).unwrap();
+        for _ in 0..10 {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            server.read_tls(&mut &buf[..]).unwrap();
+            server.process_new_packets().unwrap();
+            let mut buf = Vec::new();
+            server.write_tls(&mut buf).unwrap();
+            client.read_tls(&mut &buf[..]).unwrap();
+            client.process_new_packets().unwrap();
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        // TCP FIN: zero bytes, no close_notify alert first.
+        assert_eq!(client.read_tls(&mut &[][..]).unwrap(), 0);
+        client.process_new_packets().unwrap();
+        client.reader().read(&mut [0u8; 16]).unwrap_err()
+    }
+
+    fn libc_econnreset() -> i32 {
+        if cfg!(windows) {
+            10054
+        } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+            54
+        } else {
+            104
+        }
+    }
 }

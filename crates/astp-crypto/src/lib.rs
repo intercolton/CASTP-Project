@@ -14,9 +14,11 @@
 //! * The server name is verified. Nothing in this crate turns certificate
 //!   or name checks off. An IP literal dial host without `tls_server_name`
 //!   is a configuration error.
-//! * Server ALPN is [`SERVER_ALPN`] (`h3`, then `h2`). A QUIC client offers
-//!   the same list. A TCP client offers [`TCP_ALPN`] (`h2` only).
-//!   `astp-m/1` is not offered.
+//! * ALPN follows the transport: QUIC configs carry [`QUIC_ALPN`] (`h3`),
+//!   TLS-over-TCP configs carry [`TCP_ALPN`] (`h2`), on server and client
+//!   alike. `astp-m/1` is not offered.
+//! * [`client_config`] returns the config with the server name it verifies
+//!   ([`ClientTlsConfig`]); transports take the name from there.
 //! * mTLS is off unless [`ClientAuth::Required`] is set.
 //! * Our own keys (the server certificate and the optional mTLS client
 //!   key) must be Ed25519 or ECDSA P-256. Peer chains are not filtered,
@@ -35,15 +37,20 @@
 #![warn(missing_docs)]
 
 mod auth;
+mod credential;
 mod tls;
 
 pub use auth::{
     channel_binding, AuthError, Authenticator, ChannelBinding, ClientId, TlsSession,
     CHANNEL_BINDING_LABEL, CHANNEL_BINDING_LEN,
 };
+pub use credential::{
+    client_credential, client_credential_header, decode_credential_header, ClientSecret,
+    DuplicateKey, KeyTable, CREDENTIAL_LEN, CREDENTIAL_VERSION, KEY_ID_LEN, SECRET_LEN,
+};
 pub use tls::{
-    client_config, server_config, AlpnMode, ClientAuth, ClientOptions, CryptoError, Identity,
-    ServerOptions, TrustAnchors, SERVER_ALPN, TCP_ALPN,
+    client_config, server_config, AlpnMode, ClientAuth, ClientOptions, ClientTlsConfig,
+    CryptoError, Identity, ServerOptions, TrustAnchors, QUIC_ALPN, TCP_ALPN,
 };
 
 #[cfg(any(test, feature = "test-util"))]

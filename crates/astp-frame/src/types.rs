@@ -118,6 +118,14 @@ impl Ipv4Packet {
     }
 }
 
+impl Ipv4Packet {
+    /// The raw packet, consuming the wrapper.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 impl AsRef<[u8]> for Ipv4Packet {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
@@ -153,6 +161,14 @@ impl Ipv6Packet {
     }
 }
 
+impl Ipv6Packet {
+    /// The raw packet, consuming the wrapper.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 impl AsRef<[u8]> for Ipv6Packet {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
@@ -168,7 +184,8 @@ pub(crate) fn validate_ipv4(body: &[u8]) -> Result<(), FrameError> {
         return Err(FrameError::BadIpv4);
     }
     let total = u16::from_be_bytes(copy_at::<2>(body, 2).ok_or(FrameError::BadIpv4)?);
-    if usize::from(total) != body.len() || total < 20 {
+    // `body.len() >= 20` above, so this also rules out total < 20.
+    if usize::from(total) != body.len() {
         return Err(FrameError::BadIpv4);
     }
     Ok(())

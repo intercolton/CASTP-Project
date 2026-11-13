@@ -13,6 +13,7 @@ toml.workspace = true
 time.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+# AsyncRead/AsyncWrite for the byte counter only.
 tokio = { workspace = true }
 
 [dev-dependencies]

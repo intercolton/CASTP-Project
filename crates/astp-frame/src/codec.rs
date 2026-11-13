@@ -22,7 +22,9 @@ use crate::wire::{copy_at, copy_exact, copy_prefix};
 /// does not apply the camouflage profile; use [`crate::encode_camouflage`]
 /// for that.
 ///
-/// On error, `out` is left unchanged.
+/// The frame is written straight into `out`: the length is known before
+/// the body is, so there is no intermediate buffer and at most one
+/// reservation. On error, `out` is left unchanged.
 ///
 /// # Errors
 ///
@@ -33,8 +35,46 @@ pub fn encode_to(
     pad_octets: Option<&[u8]>,
     out: &mut Vec<u8>,
 ) -> Result<(), FrameError> {
-    let encoded = assemble(frame, pad_octets)?;
-    out.extend_from_slice(&encoded);
+    // Refuse before writing a body that cannot fit. Validation errors
+    // (bad prefix, bad IP, raw TLV of a known type, pad that does not
+    // fit in a `u16`) still win over `FrameTooLong`.
+    let declared = declared_payload_len(frame, pad_octets)?;
+    let length = u32::try_from(declared)
+        .ok()
+        .filter(|l| *l <= MAX_FRAME_LENGTH)
+        .ok_or_else(|| frame_too_long(declared))?;
+    let pad = match pad_octets {
+        Some(octets) => Some((
+            octets,
+            u16::try_from(octets.len()).map_err(|_| FrameError::BadPadding)?,
+        )),
+        None => None,
+    };
+    let total = FRAME_HEADER_LEN.saturating_add(declared);
+    out.try_reserve(total)
+        .map_err(|_| FrameError::Alloc { length: total })?;
+
+    let start = out.len();
+    let mut flags = 0u16;
+    if frame.key_epoch.is_some() {
+        flags |= FLAG_KEY_EPOCH;
+    }
+    if pad.is_some() {
+        flags |= FLAG_PAD;
+    }
+    push_header(out, frame.body.type_code(), flags, length);
+    if let Some(epoch) = frame.key_epoch {
+        out.push(epoch);
+    }
+    if let Err(err) = encode_body(&frame.body, out) {
+        out.truncate(start);
+        return Err(err);
+    }
+    if let Some((octets, pad_len)) = pad {
+        out.extend_from_slice(octets);
+        out.extend_from_slice(&pad_len.to_be_bytes());
+    }
+    debug_assert_eq!(out.len() - start, total);
     Ok(())
 }
 
@@ -98,6 +138,7 @@ pub fn decode_with(buf: &[u8], limits: DecodeLimits) -> Result<Frame, FrameError
     Ok(Frame { key_epoch, body })
 }
 
+#[cfg(test)]
 pub(crate) fn encoded_content(frame: &Frame) -> Result<Vec<u8>, FrameError> {
     let mut content = Vec::new();
     if let Some(epoch) = frame.key_epoch {
@@ -156,43 +197,6 @@ fn frame_too_long(length: usize) -> FrameError {
         length: u32::try_from(length).unwrap_or(u32::MAX),
         max_frame: MAX_FRAME_LENGTH,
     }
-}
-
-fn assemble(frame: &Frame, pad_octets: Option<&[u8]>) -> Result<Vec<u8>, FrameError> {
-    // Refuse before copying a body that cannot fit. Validation errors
-    // (bad prefix, bad IP, raw TLV of a known type, pad that does not
-    // fit in a `u16`) still win over `FrameTooLong`.
-    let declared = declared_payload_len(frame, pad_octets)?;
-    if declared > usize::try_from(MAX_FRAME_LENGTH).unwrap_or(usize::MAX) {
-        return Err(frame_too_long(declared));
-    }
-    let mut payload = encoded_content(frame)?;
-    let mut flags = 0u16;
-    if frame.key_epoch.is_some() {
-        flags |= FLAG_KEY_EPOCH;
-    }
-    if let Some(octets) = pad_octets {
-        let pad_len = u16::try_from(octets.len()).map_err(|_| FrameError::BadPadding)?;
-        flags |= FLAG_PAD;
-        payload.extend_from_slice(octets);
-        payload.extend_from_slice(&pad_len.to_be_bytes());
-    }
-    let length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
-    if length > MAX_FRAME_LENGTH {
-        return Err(FrameError::FrameTooLong {
-            length,
-            max_frame: MAX_FRAME_LENGTH,
-        });
-    }
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(FRAME_HEADER_LEN.saturating_add(payload.len()))
-        .map_err(|_| FrameError::Alloc {
-            length: FRAME_HEADER_LEN.saturating_add(payload.len()),
-        })?;
-    push_header(&mut encoded, frame.body.type_code(), flags, length);
-    encoded.extend_from_slice(&payload);
-    Ok(encoded)
 }
 
 fn payload_slice(buf: &[u8], length: u32, limits: DecodeLimits) -> Result<&[u8], FrameError> {

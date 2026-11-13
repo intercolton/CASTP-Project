@@ -154,6 +154,8 @@ async fn client_and_server_agree() {
             .unwrap_or_else(|| panic!("server has no event for {tt:?}"));
         assert_eq!(s.side, Side::Server);
         assert_eq!(s.test_type, tt);
+        assert_eq!(s.bytes_sent, "ok astp\n".len() as u64, "{s:?}");
+        assert!(s.since_conn_ms.is_some(), "{s:?}");
     }
     // One accept per client connection (tcp, tls, https, h2).
     let accepts: Vec<_> = server_events
@@ -377,6 +379,7 @@ async fn control_counts_any_http_answer_as_reachable() {
         network_id: "n".into(),
         iface: None,
         limits: cfg.limits.clone(),
+        pair_id: None,
     };
     // Controls use the public root store, so the private CA is rejected:
     // that is a certificate error, not a reachable control.
@@ -400,6 +403,7 @@ fn ctx_for(cfg: &ClientConfig) -> probes::Ctx {
         network_id: cfg.client.network_id.clone(),
         iface: None,
         limits: cfg.limits.clone(),
+        pair_id: None,
     }
 }
 
@@ -558,5 +562,590 @@ async fn download_detects_freeze_after_kilobytes() {
     assert!(d.starts_with("stalled: no data for 10 s at "), "{d}");
     assert!(e.bytes_received <= 20_000, "{e:?}");
     assert!(t.elapsed() < Duration::from_secs(15));
+    server.shutdown().await.unwrap();
+}
+
+/// A peer that finishes TLS and then says nothing must not hold a
+/// connection slot until the session limit: it is closed after
+/// `idle_timeout_seconds` and the slot is free again.
+#[tokio::test]
+async fn silent_connection_is_closed_after_idle_timeout() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let mut scfg = server_cfg(&pki, data.path(), 5);
+    scfg.limits.max_connections = 1;
+    scfg.limits.idle_timeout_seconds = 1;
+    let server = probe_server::start(scfg).await.unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+
+    // Takes the only slot: handshake, then silence.
+    let tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let tls_cfg =
+        probe_client::tlsutil::client_config(Some(Path::new(&pki.path("ca.pem"))), &[b"h2"], false)
+            .unwrap();
+    let silent =
+        probe_client::tlsutil::handshake(tls_cfg, "probe.test", tcp, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+    // While it holds the slot a second connection is turned away.
+    let busy = collect(
+        &cfg,
+        Selection {
+            h2: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(!busy[0].success, "{:?}", busy[0]);
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let free = collect(
+        &cfg,
+        Selection {
+            h2: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(free[0].success, "slot was not released: {:?}", free[0]);
+    drop(silent);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let idle = sev
+        .iter()
+        .find(|e| {
+            e.test_type == TestType::TcpAccept
+                && e.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("no request"))
+        })
+        .unwrap_or_else(|| panic!("idle close not logged: {sev:#?}"));
+    assert!(!idle.success);
+    assert_eq!(idle.error_code, Some(ErrorCode::ApplicationTimeout));
+    assert!(idle.duration_ms < 5000, "{idle:?}");
+}
+
+/// Opens TLS + HTTP/2 to the test server and returns a request sender.
+async fn h2_sender(
+    server: &probe_server::Handle,
+    pki: &Pki,
+) -> hyper::client::conn::http2::SendRequest<http_body_util::Empty<bytes::Bytes>> {
+    let tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let tls_cfg =
+        probe_client::tlsutil::client_config(Some(Path::new(&pki.path("ca.pem"))), &[b"h2"], false)
+            .unwrap();
+    let hs = probe_client::tlsutil::handshake(tls_cfg, "probe.test", tcp, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let (sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(hs.stream),
+    )
+    .await
+    .unwrap();
+    tokio::spawn(conn);
+    sender
+}
+
+/// `max_session_bytes` bounds a whole connection, not each request: one
+/// HTTP/2 connection cannot turn the server into a traffic generator by
+/// asking for many downloads.
+#[tokio::test]
+async fn download_budget_is_per_connection() {
+    use http_body_util::BodyExt;
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let mut sender = h2_sender(&server, &pki).await;
+    let get = |bytes: u64| {
+        http::Request::get(format!("https://probe.test/download?bytes={bytes}"))
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap()
+    };
+    // 1 MiB budget in server_cfg: 700 kB, then the 324 kB that is left.
+    let r = sender.send_request(get(700_000)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let n = r.into_body().collect().await.unwrap().to_bytes().len();
+    assert_eq!(n, 700_000);
+    let r = sender.send_request(get(700_000)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let n = r.into_body().collect().await.unwrap().to_bytes().len();
+    assert_eq!(n, 1_048_576 - 700_000);
+    let r = sender.send_request(get(1)).await.unwrap();
+    assert_eq!(r.status(), 429);
+
+    // A new connection has its own budget.
+    let mut fresh = h2_sender(&server, &pki).await;
+    let r = fresh.send_request(get(1000)).await.unwrap();
+    assert_eq!(r.status(), 200);
+    server.shutdown().await.unwrap();
+}
+
+/// Shutting down with a long session open still logs that connection's
+/// `tcp_accept` event instead of aborting its task.
+#[tokio::test]
+async fn shutdown_keeps_events_of_open_connections() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let mut sender = h2_sender(&server, &pki).await;
+    let req =
+        http::Request::get("https://probe.test/session?seconds=30&interval_ms=100&test_id=sd1")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let t = std::time::Instant::now();
+    server.shutdown().await.unwrap();
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    drop(resp);
+
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let accept = sev
+        .iter()
+        .find(|e| e.test_type == TestType::TcpAccept)
+        .unwrap_or_else(|| panic!("tcp_accept lost on shutdown: {sev:#?}"));
+    assert!(
+        accept
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("server shutdown"),
+        "{accept:?}"
+    );
+    assert!(sev.iter().any(|e| e.test_id == "sd1"), "{sev:#?}");
+}
+
+/// A burst of connections over the limit is logged as one counted event,
+/// not one event each.
+#[tokio::test]
+async fn refusals_are_rate_limited() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let mut scfg = server_cfg(&pki, data.path(), 5);
+    scfg.limits.max_connections = 1;
+    let server = probe_server::start(scfg).await.unwrap();
+    let _hold = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..50 {
+        let mut s = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        // The server closes refused connections at once.
+        let mut b = [0u8; 1];
+        let n = tokio::io::AsyncReadExt::read(&mut s, &mut b)
+            .await
+            .unwrap_or(0);
+        assert_eq!(n, 0);
+    }
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let refusals: Vec<_> = sev
+        .iter()
+        .filter(|e| {
+            e.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("connection limit"))
+        })
+        .collect();
+    assert!(
+        (1..=3).contains(&refusals.len()),
+        "expected a few counted events: {refusals:#?}"
+    );
+    let total: u64 = refusals
+        .iter()
+        .map(|e| {
+            let d = e.detail.as_deref().unwrap();
+            let n = d.split(": ").nth(1).unwrap().split(' ').next().unwrap();
+            n.parse::<u64>().unwrap()
+        })
+        .sum();
+    assert_eq!(total, 50, "{refusals:#?}");
+}
+
+// ------------------------------------------------------- cascade (split) ---
+
+#[tokio::test]
+async fn upload_session_runs_to_the_end() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let plan = SessionPlan {
+        seconds: 2,
+        interval_ms: 200,
+        size: 100,
+        stall_seconds: 2,
+    };
+    let e = stream::upload_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert!(e.success, "{e:?}");
+    assert_eq!(e.direction, Some(probe_common::Direction::Up));
+    assert_eq!(e.phase, Some(Phase::Completed));
+    assert!(e.duration_ms >= 1800, "{e:?}");
+    let d = e.detail.as_deref().unwrap();
+    // About 2 s / 200 ms heartbeats of 100 B, all acknowledged.
+    let sent: u64 = d.split(' ').next().unwrap().parse().unwrap();
+    assert!(
+        (800..=1200).contains(&sent) && sent.is_multiple_of(100),
+        "{d}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let s = sev
+        .iter()
+        .find(|s| s.test_id == e.test_id)
+        .expect("server logged the upload");
+    assert!(s.success, "{s:?}");
+    assert_eq!(s.direction, Some(probe_common::Direction::Up));
+    assert_eq!(s.bytes_received, sent);
+}
+
+/// Like `freezing_relay`, but the client→server direction stops after
+/// `budget` bytes: the uplink freezes while the downlink stays open.
+async fn freezing_uplink_relay(
+    upstream: std::net::SocketAddr,
+    budget: usize,
+) -> std::net::SocketAddr {
+    use tokio::io::AsyncReadExt;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (c, _) = l.accept().await.unwrap();
+        let s = tokio::net::TcpStream::connect(upstream).await.unwrap();
+        let (mut cr, mut cw) = c.into_split();
+        let (mut sr, mut sw) = s.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut sr, &mut cw).await;
+        });
+        let mut left = budget;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = match cr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let pass = n.min(left);
+            if pass > 0 {
+                sw.write_all(&buf[..pass]).await.unwrap();
+                left -= pass;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn upload_session_reports_a_freeze() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    // Enough for TLS, the HTTP/2 preface and a few heartbeats.
+    let relay = freezing_uplink_relay(server.addr, 8_000).await;
+    let cfg = client_cfg(relay.port(), &pki.path("ca.pem"), data.path());
+    let plan = SessionPlan {
+        seconds: 20,
+        interval_ms: 100,
+        size: 500,
+        stall_seconds: 2,
+    };
+    let t = std::time::Instant::now();
+    let e = stream::upload_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert_eq!(e.error_code, Some(ErrorCode::ApplicationTimeout), "{e:?}");
+    let d = e.detail.as_deref().unwrap();
+    assert!(d.starts_with("stalled: no acknowledgement for 2 s"), "{d}");
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    server.shutdown().await.unwrap();
+}
+
+/// Split-path cascade: upload to A and download from B at the same time.
+/// Both client events and both servers' events carry the same pair_id.
+#[tokio::test]
+async fn paired_probe_joins_both_servers() {
+    use probe_common::config::TargetRole;
+    use probe_common::Direction;
+    let pki = Pki::new();
+    let data_a = tempfile::tempdir().unwrap();
+    let data_b = tempfile::tempdir().unwrap();
+    let a = probe_server::start(server_cfg(&pki, data_a.path(), 5))
+        .await
+        .unwrap();
+    let b = probe_server::start(server_cfg(&pki, data_b.path(), 5))
+        .await
+        .unwrap();
+    let mut cfg = client_cfg(a.addr.port(), &pki.path("ca.pem"), data_a.path());
+    let mut down = cfg.targets[0].clone();
+    cfg.targets[0].id = "up-a".into();
+    cfg.targets[0].role = TargetRole::Uplink;
+    down.id = "down-b".into();
+    down.port = b.addr.port();
+    down.role = TargetRole::Downlink;
+    cfg.targets.push(down);
+    assert_eq!(probe_client::pairs(&cfg).len(), 1);
+
+    let plan = SessionPlan {
+        seconds: 1,
+        interval_ms: 200,
+        size: 100,
+        stall_seconds: 2,
+    };
+    let mut events = Vec::new();
+    probe_client::run_long(&cfg, plan, |e| events.push(e), |_, _, _| {}).await;
+    // A: upload only. B: download only. Then the pair.
+    assert_eq!(events.len(), 4, "{events:#?}");
+    for e in &events {
+        assert!(e.success, "{e:?}");
+        e.validate().unwrap();
+    }
+    assert_eq!(
+        (events[0].target_id.as_str(), events[0].direction),
+        ("up-a", Some(Direction::Up))
+    );
+    assert_eq!(
+        (events[1].target_id.as_str(), events[1].direction),
+        ("down-b", Some(Direction::Down))
+    );
+    assert!(events[..2].iter().all(|e| e.pair_id.is_none()));
+    let pair = events[2].pair_id.clone().expect("pair id");
+    assert_eq!(events[3].pair_id.as_deref(), Some(pair.as_str()));
+    assert_eq!(events[2].direction, Some(Direction::Up));
+    assert_eq!(events[3].direction, Some(Direction::Down));
+    // Run at the same time, not one after the other.
+    let (t2, t3) = (&events[2].timestamp, &events[3].timestamp);
+    let start = |e: &ProbeEvent| {
+        probe_common::timefmt::parse_rfc3339(&e.timestamp)
+            .unwrap()
+            .unix_timestamp_nanos()
+    };
+    let gap = (start(&events[2]) - start(&events[3])).abs();
+    assert!(gap < 500_000_000, "{t2} vs {t3}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    for (dir, data) in [(Direction::Up, &data_a), (Direction::Down, &data_b)] {
+        let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+        let s = sev
+            .iter()
+            .find(|s| s.pair_id.as_deref() == Some(pair.as_str()))
+            .unwrap_or_else(|| panic!("server for {dir:?} has no paired event: {sev:#?}"));
+        assert_eq!(s.direction, Some(dir));
+    }
+}
+
+/// HTTP/3 requests outside the probe API are logged like over TCP:
+/// status, method and path in `detail`. (Review 3.5.)
+#[tokio::test]
+async fn h3_unknown_path_is_logged() {
+    use bytes::Buf;
+    use std::sync::Arc;
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(with_quic(server_cfg(&pki, data.path(), 5)))
+        .await
+        .unwrap();
+    let qaddr = server.quic_addr.unwrap();
+
+    let tls =
+        probe_client::tlsutil::client_config(Some(Path::new(&pki.path("ca.pem"))), &[b"h3"], true)
+            .unwrap();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let conn = ep.connect(qaddr, "probe.test").unwrap().await.unwrap();
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(conn.clone()))
+        .await
+        .unwrap();
+    let drive = tokio::spawn(async move { driver.wait_idle().await });
+    let req = http::Request::get(format!("https://probe.test:{}/nope?x=1", qaddr.port()))
+        .header("x-astp-test-id", "h3-unknown")
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(req).await.unwrap();
+    stream.finish().await.unwrap();
+    let resp = stream.recv_response().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+        chunk.advance(chunk.remaining());
+    }
+    drop(send);
+    conn.close(0x100u32.into(), b"done");
+    drive.abort();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    let e = sev
+        .iter()
+        .find(|e| e.test_id == "h3-unknown")
+        .unwrap_or_else(|| panic!("unknown h3 path not logged: {sev:#?}"));
+    assert_eq!(e.test_type, TestType::H3Request);
+    assert_eq!(e.transport, probe_common::Transport::Quic);
+    let d = e.detail.as_deref().unwrap();
+    assert!(d.starts_with("404 GET /nope?x=1"), "{d}");
+}
+
+// ------------------------------------------------------------ scheduler ---
+
+#[tokio::test]
+async fn scheduler_alternates_quick_and_long_without_overlap() {
+    use probe_client::schedule::{run_scheduled, Ran, Schedule};
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let sched = Schedule {
+        quick_every: Duration::from_millis(300),
+        long_every: Duration::from_millis(800),
+        long_plan: SessionPlan {
+            seconds: 1,
+            interval_ms: 200,
+            size: 100,
+            stall_seconds: 2,
+        },
+        jitter_percent: 10,
+        campaign: Some(Duration::from_secs(4)),
+        no_long: false,
+    };
+    let mut events = Vec::new();
+    let mut runs = Vec::new();
+    let t = std::time::Instant::now();
+    run_scheduled(
+        &cfg,
+        sched,
+        |e| events.push(e),
+        |r| runs.push(r),
+        std::future::pending(),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
+    assert_eq!(runs.first(), Some(&Ran::Quick), "{runs:?}");
+    let quick = runs.iter().filter(|r| **r == Ran::Quick).count();
+    let long = runs.iter().filter(|r| **r == Ran::Long).count();
+    assert!(quick >= 3 && long >= 1, "{runs:?}");
+    for e in &events {
+        assert!(e.success, "{e:?}");
+    }
+    // role = both: a long pass is a download and an upload session.
+    let sessions = events
+        .iter()
+        .filter(|e| e.test_type == TestType::LongSession)
+        .count();
+    assert_eq!(sessions, 2 * long);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn scheduler_stops_at_once_on_signal() {
+    use probe_client::schedule::{run_scheduled, Schedule};
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let server = probe_server::start(server_cfg(&pki, data.path(), 5))
+        .await
+        .unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let sched = Schedule {
+        quick_every: Duration::from_secs(3600),
+        long_every: Duration::from_millis(1),
+        long_plan: SessionPlan {
+            seconds: 60,
+            interval_ms: 200,
+            size: 100,
+            stall_seconds: 2,
+        },
+        jitter_percent: 0,
+        campaign: None,
+        no_long: false,
+    };
+    let t = std::time::Instant::now();
+    // Stops in the middle of a 60 s long session.
+    run_scheduled(
+        &cfg,
+        sched,
+        |_| {},
+        |_| {},
+        tokio::time::sleep(Duration::from_secs(2)),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    server.shutdown().await.unwrap();
+}
+
+/// An HTTP/2 connection that never sends a request is idle even though
+/// the server's keepalive PINGs and the client's ACKs keep bytes moving.
+#[tokio::test]
+async fn idle_h2_connection_is_closed_despite_pings() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let mut scfg = server_cfg(&pki, data.path(), 5);
+    scfg.limits.max_connections = 1;
+    scfg.limits.idle_timeout_seconds = 1;
+    let server = probe_server::start(scfg).await.unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+
+    // Preface and SETTINGS, then nothing but PING/ACK (every 0.5 s here).
+    let sender = h2_sender(&server, &pki).await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let free = collect(
+        &cfg,
+        Selection {
+            h2: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        free[0].success,
+        "slot still held by an idle h2 connection: {:?}",
+        free[0]
+    );
+    drop(sender);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.shutdown().await.unwrap();
+    let (sev, _) = read_events(&data.path().join("server-events.jsonl")).unwrap();
+    assert!(
+        sev.iter().any(|e| e.test_type == TestType::TcpAccept
+            && e.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("no request"))),
+        "{sev:#?}"
+    );
+}
+
+/// A request in flight is activity: a session whose heartbeats are
+/// further apart than the idle timeout runs to its end.
+#[tokio::test]
+async fn slow_session_is_not_idle() {
+    let pki = Pki::new();
+    let data = tempfile::tempdir().unwrap();
+    let mut scfg = server_cfg(&pki, data.path(), 5);
+    scfg.limits.idle_timeout_seconds = 1;
+    let server = probe_server::start(scfg).await.unwrap();
+    let cfg = client_cfg(server.addr.port(), &pki.path("ca.pem"), data.path());
+    let plan = SessionPlan {
+        seconds: 4,
+        interval_ms: 1500,
+        size: 100,
+        stall_seconds: 4,
+    };
+    let e = stream::long_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert!(e.success, "{e:?}");
+    let e = stream::upload_session(&ctx_for(&cfg), &cfg.targets[0], plan, |_, _| {}).await;
+    assert!(e.success, "{e:?}");
     server.shutdown().await.unwrap();
 }

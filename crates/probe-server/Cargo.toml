@@ -18,10 +18,11 @@ probe-common.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pki-types.workspace = true
+h2.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true

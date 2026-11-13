@@ -10,9 +10,18 @@ use crate::error_code::ErrorCode;
 use crate::timefmt;
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// Version written by this build.
+///
+/// - 1: timestamps in whole seconds.
+/// - 2: timestamps with milliseconds; optional `direction`, `pair_id` and
+///   `since_conn_ms`.
+pub const SCHEMA_VERSION: u32 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Versions this build reads. Version 1 lines differ only in timestamp
+/// precision and in lacking the version 2 fields.
+pub const READABLE_SCHEMA_VERSIONS: std::ops::RangeInclusive<u32> = 1..=SCHEMA_VERSION;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestType {
     DnsResolution,
@@ -50,12 +59,33 @@ impl TestType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Udp,
     Tcp,
     Quic,
+}
+
+/// Which way the measured payload flows, seen from the client. Set on
+/// directional tests (download, long sessions); in a split-path cascade
+/// the upload and the download legs end on different servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// Client to server.
+    Up,
+    /// Server to client.
+    Down,
+}
+
+impl Direction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Direction::Up => "up",
+            Direction::Down => "down",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +151,17 @@ pub struct ProbeEvent {
     pub connect_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handshake_ms: Option<u64>,
+    /// Server side: milliseconds on the server's monotonic clock from the
+    /// accept of the connection to this event's start. Ties request events
+    /// to their `tcp_accept`/`quic_accept` without trusting the wall clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_conn_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Direction>,
+    /// Shared by the upload and download halves of a paired probe, on the
+    /// client and on both servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
 }
 
 fn default_side() -> Side {
@@ -165,6 +206,9 @@ impl ProbeEvent {
             peer: None,
             connect_ms: None,
             handshake_ms: None,
+            since_conn_ms: None,
+            direction: None,
+            pair_id: None,
         }
     }
 
@@ -187,7 +231,7 @@ impl ProbeEvent {
 
     /// Checks the invariants every written event must hold.
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != SCHEMA_VERSION {
+        if !READABLE_SCHEMA_VERSIONS.contains(&self.schema_version) {
             return Err(format!("unknown schema_version {}", self.schema_version));
         }
         if timefmt::parse_rfc3339(&self.timestamp).is_none() {
@@ -230,6 +274,19 @@ mod tests {
     }
 
     #[test]
+    fn writes_schema_2_with_milliseconds() {
+        let e = sample().succeed();
+        assert_eq!(e.schema_version, 2);
+        // 2026-11-02T12:00:00.123Z
+        assert_eq!(e.timestamp.len(), 24, "{}", e.timestamp);
+        assert_eq!(&e.timestamp[19..20], ".");
+        e.validate().unwrap();
+        let mut future = e.clone();
+        future.schema_version = 3;
+        assert!(future.validate().is_err());
+    }
+
+    #[test]
     fn required_fields_always_serialized_and_optional_skipped() {
         let e = sample().succeed();
         let v: serde_json::Value = serde_json::to_value(&e).unwrap();
@@ -261,6 +318,8 @@ mod tests {
         e.phase = Some(Phase::TcpConnected);
         e.tls_stack = Some("rustls-0.23/ring".into());
         e.control = true;
+        e.direction = Some(Direction::Up);
+        e.pair_id = Some("p1".into());
         let s = serde_json::to_string(&e).unwrap();
         let back: ProbeEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back, e);

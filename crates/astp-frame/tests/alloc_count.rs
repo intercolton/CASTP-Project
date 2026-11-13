@@ -208,6 +208,33 @@ fn small_frames_allocate_once_and_a_large_frame_drops_the_buffer() {
     // so a second `#[test]` would be counted inside this window.
     payloads_4097_to_8192_do_not_reallocate_each_frame();
     header_errors_and_overlong_encode_stay_small();
+    encode_writes_in_place();
+}
+
+/// Encoding writes header and body straight into the output: one
+/// allocation of the frame's size for `encode`, none for `encode_to`
+/// into a buffer that already has room.
+fn encode_writes_in_place() {
+    let frame = disconnect(60_000);
+    let (bytes, fresh) = sample(|| encode(&frame, Some(&[0u8; 100])).unwrap());
+    eprintln!(
+        "encode 60000 B: allocs={} reallocs={} extra_peak={}",
+        fresh.allocs, fresh.reallocs, fresh.extra_peak
+    );
+    assert_eq!(fresh.allocs, 1, "one buffer for the whole frame");
+    assert_eq!(fresh.reallocs, 0);
+    assert!(
+        fresh.extra_peak <= bytes.len() + 64,
+        "peak {} for a {} B frame: an intermediate copy is alive",
+        fresh.extra_peak,
+        bytes.len()
+    );
+
+    let mut out = Vec::with_capacity(2 * bytes.len());
+    let (_, reused) =
+        sample(|| astp_frame::encode_to(&frame, Some(&[0u8; 100]), &mut out).unwrap());
+    assert_eq!(reused.allocs, 0, "encode_to into a roomy buffer allocated");
+    assert_eq!(out, bytes);
 }
 
 fn disconnect(payload: usize) -> Frame {

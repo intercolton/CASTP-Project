@@ -142,24 +142,46 @@ mod tests {
         assert_eq!(f.code, ErrorCode::TcpRefused);
     }
 
+    /// Hermetic: a local listener whose accept queue is full drops further
+    /// SYNs (Linux, `tcp_abort_on_overflow = 0`), so the connect sees no
+    /// SYN-ACK. No packet leaves the machine, unlike probing a TEST-NET
+    /// address, which a proxy or filter can answer with a refusal.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn timeout_is_classified() {
-        // 192.0.2.0/24 (TEST-NET-1) is never routed: the SYN goes unanswered,
-        // or the kernel reports the network as unreachable.
-        let f = connect(
-            "192.0.2.1:9".parse().unwrap(),
-            None,
-            Duration::from_millis(300),
+        let listener = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
         )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(
-                f.code,
-                ErrorCode::TcpTimeout | ErrorCode::LocalNetworkUnavailable
-            ),
-            "{f:?}"
-        );
+        .unwrap();
+        listener
+            .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        listener.listen(0).unwrap();
+        let addr = listener.local_addr().unwrap().as_socket().unwrap();
+
+        // Never accepted: fill the queue until a connect stops completing.
+        let mut held = Vec::new();
+        let mut full = false;
+        for _ in 0..16 {
+            match connect(addr, None, Duration::from_millis(300)).await {
+                Ok(s) => held.push(s),
+                Err(f) => {
+                    assert_eq!(f.code, ErrorCode::TcpTimeout, "{f:?}");
+                    full = true;
+                    break;
+                }
+            }
+        }
+        assert!(full, "accept queue never filled ({} connected)", held.len());
+
+        let f = connect(addr, None, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert_eq!(f.code, ErrorCode::TcpTimeout, "{f:?}");
+        assert!(f.detail.contains("no SYN-ACK"), "{f:?}");
+        drop(listener);
     }
 
     #[tokio::test]

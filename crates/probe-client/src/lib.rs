@@ -4,12 +4,13 @@
 pub mod netutil;
 pub mod probes;
 pub mod quic;
+pub mod schedule;
 pub mod stream;
 pub mod tlsutil;
 
 pub use probe_common::error_chain;
 
-use probe_common::config::{ClientConfig, TargetConfig};
+use probe_common::config::{ClientConfig, TargetConfig, TargetRole};
 use probe_common::ProbeEvent;
 
 /// Which short tests to run.
@@ -66,21 +67,56 @@ fn ctx(cfg: &ClientConfig) -> probes::Ctx {
         network_id: cfg.client.network_id.clone(),
         iface: cfg.client.bind_interface.clone(),
         limits: cfg.limits.clone(),
+        pair_id: None,
     }
 }
 
-/// One long session per target that has TLS enabled, one after another.
+/// Long sessions, one after another: for each target with TLS, a download
+/// session if its role takes downloads and an upload session if it takes
+/// uploads. Then one paired probe per (uplink, downlink) pair of targets:
+/// upload to the first and download from the second at the same time,
+/// as split-path traffic would flow, with a shared `pair_id`.
 /// `progress(target, seconds, bytes)` reports a running session.
 pub async fn run_long(
     cfg: &ClientConfig,
     plan: stream::SessionPlan,
     mut sink: impl FnMut(ProbeEvent),
-    mut progress: impl FnMut(&str, u64, u64),
+    progress: impl FnMut(&str, u64, u64),
 ) {
     let ctx = ctx(cfg);
+    // Both halves of a pair report through the same callback.
+    let progress = std::cell::RefCell::new(progress);
+    let report = |id: &str, s, b| (progress.borrow_mut())(id, s, b);
     for t in cfg.targets.iter().filter(|t| t.enable_tls) {
-        sink(stream::long_session(&ctx, t, plan, |s, b| progress(&t.id, s, b)).await);
+        if t.role.down() {
+            sink(stream::long_session(&ctx, t, plan, |s, b| report(&t.id, s, b)).await);
+        }
+        if t.role.up() {
+            sink(stream::upload_session(&ctx, t, plan, |s, b| report(&t.id, s, b)).await);
+        }
     }
+    for (up, down) in pairs(cfg) {
+        let mut pctx = ctx.clone();
+        pctx.pair_id = Some(ProbeEvent::new_test_id());
+        let (u, d) = tokio::join!(
+            stream::upload_session(&pctx, up, plan, |s, b| report(&up.id, s, b)),
+            stream::long_session(&pctx, down, plan, |s, b| report(&down.id, s, b)),
+        );
+        sink(u);
+        sink(d);
+    }
+}
+
+/// (uplink, downlink) target pairs for the paired cascade probe.
+pub fn pairs(cfg: &ClientConfig) -> Vec<(&TargetConfig, &TargetConfig)> {
+    let with = |r| {
+        cfg.targets
+            .iter()
+            .filter(move |t: &&TargetConfig| t.enable_tls && t.role == r)
+    };
+    with(TargetRole::Uplink)
+        .flat_map(|u| with(TargetRole::Downlink).map(move |d| (u, d)))
+        .collect()
 }
 
 async fn run_target(
@@ -110,7 +146,7 @@ async fn run_target(
     if sel.h3 && t.enable_h3 {
         sink(quic::h3(ctx, t).await);
     }
-    if sel.download && t.enable_tls {
+    if sel.download && t.enable_tls && t.role.down() {
         let bytes = if sel.download_bytes == 0 {
             1024 * 1024
         } else {
